@@ -15,17 +15,28 @@ class LiveStreamer:
     """
     def __init__(
         self,
-        job_id: str,
+        job_id: Optional[str] = None,
         output_packet_path: Optional[str] = None,
         max_points: int = 65536,
-        stream_interval: int = 150,
+        stream_interval: Optional[int] = None,
         streaming_flag_path: Optional[str] = None,
     ):
-        self.job_id = job_id
+        self.job_id = job_id or os.getenv("JOB_ID", "default_job")
         self.max_points = max_points
-        self.stream_interval = stream_interval
-        self.output_packet_path = Path(output_packet_path) if output_packet_path else None
-        self.streaming_flag_path = Path(streaming_flag_path) if streaming_flag_path else None
+
+        env_interval = os.getenv("STREAM_INTERVAL")
+        if stream_interval is not None:
+            self.stream_interval = stream_interval
+        elif env_interval and env_interval.isdigit():
+            self.stream_interval = int(env_interval)
+        else:
+            self.stream_interval = 150
+
+        packet_p = output_packet_path or os.getenv("LIVE_STREAM_PACKET")
+        self.output_packet_path = Path(packet_p) if packet_p else None
+
+        flag_p = streaming_flag_path or os.getenv("STREAMING_FLAG")
+        self.streaming_flag_path = Path(flag_p) if flag_p else None
 
         self.frame_queue = queue.Queue(maxsize=1)
         self.is_running = True

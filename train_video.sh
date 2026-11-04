@@ -537,15 +537,12 @@ echo "  sdf_trunc   = $SDF_TRUNC (5 * voxel_size)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
 
-# Якщо передано LIVE_STREAM_PACKET, додаємо параметри стримінгу для train.py
-STREAM_ARGS=()
+# Експортуємо змінні середовища для streamer, щоб не змінювати CLI-аргументи стороннього train.py
 if [[ -n "$LIVE_STREAM_PACKET" ]]; then
-    STREAM_ARGS+=(
-        --live_stream_packet "$LIVE_STREAM_PACKET"
-        --streaming_flag "$STREAMING_FLAG"
-        --stream_interval "$STREAM_INTERVAL"
-        --job_id "$JOB_ID"
-    )
+    export LIVE_STREAM_PACKET
+    export STREAMING_FLAG
+    export STREAM_INTERVAL
+    export JOB_ID
 fi
 
 python3 train.py \
@@ -563,7 +560,6 @@ python3 train.py \
     --voxel_size "$VOXEL_SIZE" \
     --sdf_trunc "$SDF_TRUNC" \
     --depth_trunc "$DEPTH_TRUNC" \
-    "${STREAM_ARGS[@]}" \
     -o "$MESH"
 
 echo "Навчання завершено за $((SECONDS - STAGE_START)) сек."
