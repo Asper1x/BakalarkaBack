@@ -54,9 +54,66 @@ async def get_gpu_stats():
     return await job_manager.get_gpu_stats()
 
 
+@app.get("/datasets")
+async def list_datasets():
+    """Scan DATASETS_ROOT and list all valid datasets with their readiness level."""
+    return job_manager.get_datasets_list()
+
+
+@app.get("/datasets/{dataset_name}/thumbnail")
+async def get_dataset_thumbnail(dataset_name: str):
+    """Return a resized preview image (thumbnail) for an existing dataset."""
+    safe_name = dataset_name.strip()
+    if not job_manager.NAME_PATTERN.match(safe_name):
+        raise HTTPException(status_code=400, detail="Invalid dataset name.")
+
+    root = config.DATASETS_ROOT.resolve()
+    target = (root / safe_name).resolve()
+    if not str(target).startswith(str(root)) or not target.is_dir():
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+
+    img_dir = None
+    for cand in ["images", "input"]:
+        d = target / cand
+        if d.is_dir():
+            img_dir = d
+            break
+    if img_dir is None:
+        img_dir = target
+
+    image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+    preview_file = None
+    for f in sorted(img_dir.iterdir()):
+        if f.is_file() and f.suffix.lower() in image_exts:
+            preview_file = f
+            break
+
+    if not preview_file:
+        raise HTTPException(status_code=404, detail="No preview image found in dataset.")
+
+    # Generate or return cached thumbnail
+    thumb_path = config.UPLOADS_DIR / f"thumb_{safe_name}.jpg"
+    if thumb_path.is_file() and thumb_path.stat().st_mtime >= preview_file.stat().st_mtime:
+        return FileResponse(thumb_path, media_type="image/jpeg")
+
+    try:
+        from PIL import Image
+        with Image.open(preview_file) as im:
+            im = im.convert("RGB")
+            im.thumbnail((240, 240))
+            im.save(thumb_path, "JPEG", quality=85)
+        return FileResponse(thumb_path, media_type="image/jpeg")
+    except Exception:
+        # Fallback to serving the raw image directly
+        media = "image/png" if preview_file.suffix.lower() == ".png" else "image/jpeg"
+        return FileResponse(preview_file, media_type=media)
+
+
 @app.post("/jobs", status_code=202)
 async def create_job(
-    video: UploadFile = File(..., description="Input video file (.mp4, .mov, etc.)"),
+    input_mode: str = Form("video", description="'video' or 'dataset'"),
+    video: Optional[UploadFile] = File(None, description="Input video file (required if input_mode='video')"),
+    dataset_name: Optional[str] = Form(None, description="Existing dataset name in DATASETS_ROOT (required if input_mode='dataset')"),
     name: Optional[str] = Form(None, description="Optional project name (letters, digits, '_', '-')"),
     fps: int = Form(config.DEFAULT_FPS, ge=1, le=60, description="Frames per second to extract"),
     iterations: int = Form(config.DEFAULT_ITERATIONS, ge=100, le=100_000, description="Training iterations"),
@@ -65,25 +122,34 @@ async def create_job(
     filter_blurry: bool = Form(config.DEFAULT_FILTER_BLURRY, description="Laplacian sharpness frame filtering in Stage 1"),
     mask_foreground: bool = Form(config.DEFAULT_MASK_FOREGROUND, description="Optional foreground masking (rembg) in Stage 1"),
 ):
-    if not video.filename:
-        raise HTTPException(status_code=400, detail="Video filename is required.")
+    if input_mode not in ("video", "dataset"):
+        raise HTTPException(status_code=400, detail="input_mode must be 'video' or 'dataset'.")
 
-    ext = Path(video.filename).suffix.lower()
-    if ext not in ALLOWED_VIDEO_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file extension '{ext}'. Allowed: {sorted(ALLOWED_VIDEO_EXTENSIONS)}",
-        )
+    saved_path = None
+    if input_mode == "video":
+        if not video or not video.filename:
+            raise HTTPException(status_code=400, detail="Video file is required when input_mode is 'video'.")
 
-    temp_filename = f"upload_{Path(video.filename).name}"
-    saved_path = config.UPLOADS_DIR / temp_filename
+        ext = Path(video.filename).suffix.lower()
+        if ext not in ALLOWED_VIDEO_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file extension '{ext}'. Allowed: {sorted(ALLOWED_VIDEO_EXTENSIONS)}",
+            )
 
-    try:
+        temp_filename = f"upload_{Path(video.filename).name}"
+        saved_path = config.UPLOADS_DIR / temp_filename
         with saved_path.open("wb") as buffer:
             shutil.copyfileobj(video.file, buffer)
+    elif input_mode == "dataset":
+        if not dataset_name:
+            raise HTTPException(status_code=400, detail="dataset_name is required when input_mode is 'dataset'.")
 
+    try:
         job = await job_manager.submit_job(
             video_path=saved_path,
+            input_mode=input_mode,
+            dataset_name=dataset_name,
             project_name=name,
             fps=fps,
             iterations=iterations,
@@ -93,11 +159,14 @@ async def create_job(
             mask_foreground=mask_foreground,
         )
         return job.to_dict()
-    except ValueError as exc:
-        saved_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=str(exc))
+    except (ValueError, FileNotFoundError) as exc:
+        if saved_path and saved_path.exists():
+            saved_path.unlink(missing_ok=True)
+        code = 404 if isinstance(exc, FileNotFoundError) else 400
+        raise HTTPException(status_code=code, detail=str(exc))
     except RuntimeError as exc:
-        saved_path.unlink(missing_ok=True)
+        if saved_path and saved_path.exists():
+            saved_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=str(exc))
 
 

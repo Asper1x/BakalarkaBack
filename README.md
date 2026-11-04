@@ -45,8 +45,11 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 ## API Endpoints
 
 - `GET /health` — Check backend status, Slurm (`sbatch`) availability, and configured paths.
-- `POST /jobs` — Upload a video (`multipart/form-data`) and submit a Slurm job.
-  - Form fields: `video` (file, required), `name` (optional), `fps` (default `6`), `resolution` (default `1`), `iterations` (default `20000`), `video_resolution` (default `1920x1080`), `filter_blurry` (default `true`), `mask_foreground` (default `false`).
+- `GET /gpu` — Get current GPU utilization, VRAM usage, and temperature.
+- `GET /datasets` — List available pre-existing datasets on the server with their readiness level (`ready_for_training`, `needs_priors`, `raw_images`).
+- `GET /datasets/{dataset_name}/thumbnail` — Serve a 240px preview thumbnail for an existing dataset.
+- `POST /jobs` — Upload a video or select an existing dataset and submit a Slurm job.
+  - Form fields: `input_mode` ("video" or "dataset"), `video` (file, required if `input_mode="video"`), `dataset_name` (required if `input_mode="dataset"`), `name` (optional), `fps` (default `6`), `resolution` (default `1`), `iterations` (default `20000`), `video_resolution` (default `1920x1080`), `filter_blurry` (default `true`), `mask_foreground` (default `false`).
 - `GET /jobs` — List all jobs and their current Slurm & pipeline status.
 - `GET /jobs/{job_id}` — Get job status, `slurm_job_id`, `slurm_state`, progress stage (`1/5`–`5/5`), `has_cameras`, `has_sparse_cloud`, structured artifact keys (`step1_artifact`, `step2_artifact`, `companion_texture`, `companion_mtl`, `gaussian_ply`), and generated 3D model artifacts.
 - `GET /jobs/{job_id}/gpu` — Get live GPU stats for this specific Slurm job.

@@ -37,7 +37,12 @@ class JobStatus(str, Enum):
 class Job:
     id: str
     name: str
-    video_path: str
+    video_path: Optional[str] = None
+    input_mode: str = "video"
+    dataset_name: Optional[str] = None
+    source_dataset_path: Optional[str] = None
+    start_stage: int = 1
+    skipped_stages: list[int] = field(default_factory=list)
     slurm_job_id: Optional[str] = None
     status: JobStatus = JobStatus.QUEUED
     slurm_state: Optional[str] = None
@@ -56,6 +61,11 @@ class Job:
 
     @property
     def dataset_dir(self) -> Path:
+        if self.input_mode == "dataset" and self.source_dataset_path:
+            p = Path(self.source_dataset_path)
+            # If the source dataset already has sparse/0, train_video.sh uses it directly
+            if (p / "sparse" / "0").is_dir():
+                return p
         return config.DATASETS_ROOT / f"{self.name}-colmap-video"
 
     @property
@@ -124,6 +134,10 @@ class Job:
         data["has_cameras"] = self.has_cameras
         data["has_sparse_cloud"] = self.has_sparse_cloud
         data["is_streaming"] = self.live_packet_path.is_file()
+        data["input_mode"] = self.input_mode
+        data["dataset_name"] = self.dataset_name
+        data["start_stage"] = self.start_stage
+        data["skipped_stages"] = self.skipped_stages
 
         grouped = self.grouped_artifacts(artifacts)
         data["step1_artifact"] = grouped["step1_artifact"]
@@ -307,17 +321,22 @@ class JobManager:
             f"VIDEO_RESOLUTION={shlex.quote(job.video_resolution)} "
             f"FILTER_BLURRY={'1' if job.filter_blurry else '0'} "
             f"MASK_FOREGROUND={'1' if job.mask_foreground else '0'} "
+            f"INPUT_MODE={shlex.quote(job.input_mode)} "
+            f"SOURCE_DATASET={shlex.quote(job.source_dataset_path or '')} "
+            f"START_STAGE={job.start_stage} "
             f"LIVE_STREAM_PACKET={shlex.quote(str(job.live_packet_path))} "
             f"STREAMING_FLAG={shlex.quote(str(job.streaming_flag_path))} "
             f"JOB_ID={shlex.quote(job.id)} "
             f"{shlex.quote(str(config.SCRIPT_PATH))} "
-            f"{shlex.quote(job.video_path)} "
+            f"{shlex.quote(job.video_path or '')} "
             f"{shlex.quote(job.name)}\n"
         )
 
     async def submit_job(
         self,
-        video_path: Path,
+        video_path: Optional[Path] = None,
+        input_mode: str = "video",
+        dataset_name: Optional[str] = None,
         project_name: Optional[str] = None,
         fps: int = config.DEFAULT_FPS,
         iterations: int = config.DEFAULT_ITERATIONS,
@@ -329,22 +348,64 @@ class JobManager:
         job_id = uuid.uuid4().hex[:12]
         if project_name:
             clean_name = f"{project_name}_{job_id[:6]}"
-        else:
+        elif input_mode == "dataset" and dataset_name:
+            clean_name = f"{dataset_name}_{job_id[:6]}"
+        elif video_path:
             stem = re.sub(r"[^a-zA-Z0-9_-]", "_", video_path.stem).strip("_") or "model"
             clean_name = f"{stem}_{job_id[:6]}"
+        else:
+            clean_name = f"model_{job_id[:6]}"
 
         if not NAME_PATTERN.match(clean_name):
             raise ValueError("Project name may only contain letters, digits, '_' and '-'.")
         if not VIDEO_RES_PATTERN.match(video_resolution):
             raise ValueError("video_resolution must be in WIDTHxHEIGHT format (e.g. 1920x1080).")
 
-        final_video_path = config.UPLOADS_DIR / f"{job_id}{video_path.suffix.lower()}"
-        video_path.rename(final_video_path)
+        final_video_str = None
+        if input_mode == "video" and video_path:
+            final_video_path = config.UPLOADS_DIR / f"{job_id}{video_path.suffix.lower()}"
+            video_path.rename(final_video_path)
+            final_video_str = str(final_video_path)
+
+        source_dataset_str = None
+        start_stage = 1
+        skipped_stages = []
+
+        if input_mode == "dataset":
+            if not dataset_name:
+                raise ValueError("dataset_name is required when input_mode is 'dataset'.")
+            safe_name = dataset_name.strip()
+            if not NAME_PATTERN.match(safe_name):
+                raise ValueError(f"Invalid dataset name '{safe_name}'.")
+
+            dataset_path = (config.DATASETS_ROOT / safe_name).resolve()
+            if not str(dataset_path).startswith(str(config.DATASETS_ROOT.resolve())) or not dataset_path.is_dir():
+                raise FileNotFoundError(f"Dataset '{safe_name}' does not exist on server.")
+
+            source_dataset_str = str(dataset_path)
+
+            has_sparse = (dataset_path / "sparse" / "0").is_dir()
+            has_priors = (dataset_path / "depth_priors").is_dir() or (dataset_path / "depths").is_dir()
+
+            if has_sparse and has_priors:
+                start_stage = 5
+                skipped_stages = [1, 2, 3, 4]
+            elif has_sparse:
+                start_stage = 4
+                skipped_stages = [1, 2, 3]
+            else:
+                start_stage = 2
+                skipped_stages = [1]
 
         job = Job(
             id=job_id,
             name=clean_name,
-            video_path=str(final_video_path),
+            video_path=final_video_str,
+            input_mode=input_mode,
+            dataset_name=dataset_name,
+            source_dataset_path=source_dataset_str,
+            start_stage=start_stage,
+            skipped_stages=skipped_stages,
             fps=fps,
             iterations=iterations,
             resolution=resolution,
@@ -599,6 +660,71 @@ class JobManager:
             except ValueError:
                 continue
         return gpus
+
+    def get_datasets_list(self) -> list[dict]:
+        """Scan DATASETS_ROOT for existing datasets and report their readiness level."""
+        datasets = []
+        root = config.DATASETS_ROOT
+        if not root.is_dir():
+            return datasets
+
+        image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+
+        for item in sorted(root.iterdir()):
+            if not item.is_dir() or item.name.startswith("."):
+                continue
+
+            # Count images in input or images folder, or root of item
+            img_count = 0
+            img_dir = None
+            for cand in ["images", "input"]:
+                d = item / cand
+                if d.is_dir():
+                    img_dir = d
+                    break
+            if img_dir is None:
+                img_dir = item
+
+            try:
+                img_count = sum(1 for f in img_dir.iterdir() if f.is_file() and f.suffix.lower() in image_exts)
+            except Exception:
+                img_count = 0
+
+            # If no images, check if item itself is not a dataset
+            has_sparse = (item / "sparse" / "0").is_dir()
+            has_priors = (item / "depth_priors").is_dir() or (item / "depths").is_dir() or (item / "depth_vis").is_dir()
+
+            if img_count == 0 and not has_sparse:
+                continue
+
+            if has_sparse and has_priors:
+                readiness = "ready_for_training"
+            elif has_sparse:
+                readiness = "needs_priors"
+            else:
+                readiness = "raw_images"
+
+            # Compute size
+            size_bytes = 0
+            try:
+                for f in item.rglob("*"):
+                    if f.is_file():
+                        size_bytes += f.stat().st_size
+            except Exception:
+                pass
+
+            datasets.append({
+                "name": item.name,
+                "path": str(item),
+                "image_count": img_count,
+                "size_bytes": size_bytes,
+                "has_colmap": has_sparse,
+                "has_priors": has_priors,
+                "readiness": readiness,
+                "preview_image": f"/datasets/{item.name}/thumbnail"
+            })
+
+        return datasets
 
     async def get_gpu_stats(self, job: Optional[Job] = None) -> dict:
         # 1. If a specific job is requested and has recorded GPU stats from Slurm node, use it

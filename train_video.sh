@@ -40,6 +40,11 @@ JOB_ID="${JOB_ID:-$NAME}"
 VIDEO="${1:-}"
 NAME="${2:-}"
 
+# Підтримка готових датасетів (branching pipeline)
+INPUT_MODE="${INPUT_MODE:-video}"          # "video" або "dataset"
+SOURCE_DATASET="${SOURCE_DATASET:-}"        # шлях до існуючого датасету
+START_STAGE="${START_STAGE:-1}"             # 1..5
+
 usage() {
     echo "Використання:"
     echo "  $0 <video.mp4> [назва_проєкту]"
@@ -48,21 +53,39 @@ usage() {
     echo "  $0 ~/videos/stol.mp4 stol"
     echo
     echo "Необов'язкові змінні:"
-    echo "  FPS=6 MAX_FRAMES=220 ITERATIONS=20000 RESOLUTION=1"
+    echo "  FPS=6 MAX_FRAMES=220 ITERATIONS=20000 RESOLUTION=1 INPUT_MODE=dataset SOURCE_DATASET=/path/to/dataset"
     exit 1
 }
 
-[[ -n "$VIDEO" ]] || usage
-[[ -f "$VIDEO" ]] || {
-    echo "ПОМИЛКА: відео не знайдено: $VIDEO"
+if [[ "$INPUT_MODE" == "video" ]]; then
+    [[ -n "$VIDEO" ]] || usage
+    [[ -f "$VIDEO" ]] || {
+        echo "ПОМИЛКА: відео не знайдено: $VIDEO"
+        exit 1
+    }
+    VIDEO="$(realpath "$VIDEO")"
+
+    # Назва проєкту за замовчуванням береться з назви відео.
+    if [[ -z "$NAME" ]]; then
+        NAME="$(basename "${VIDEO%.*}")"
+    fi
+elif [[ "$INPUT_MODE" == "dataset" ]]; then
+    [[ -n "$SOURCE_DATASET" ]] || {
+        echo "ПОМИЛКА: для INPUT_MODE=dataset необхідно вказати SOURCE_DATASET."
+        exit 1
+    }
+    [[ -d "$SOURCE_DATASET" ]] || {
+        echo "ПОМИЛКА: датасет не знайдено: $SOURCE_DATASET"
+        exit 1
+    }
+    SOURCE_DATASET="$(realpath "$SOURCE_DATASET")"
+
+    if [[ -z "$NAME" ]]; then
+        NAME="$(basename "$SOURCE_DATASET")"
+    fi
+else
+    echo "ПОМИЛКА: невідомий INPUT_MODE=$INPUT_MODE (очікується 'video' або 'dataset')"
     exit 1
-}
-
-VIDEO="$(realpath "$VIDEO")"
-
-# Назва проєкту за замовчуванням береться з назви відео.
-if [[ -z "$NAME" ]]; then
-    NAME="$(basename "${VIDEO%.*}")"
 fi
 
 if [[ ! "$NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -72,6 +95,56 @@ fi
 
 DATASET="$DATASETS_ROOT/${NAME}-colmap-video"
 WORKSPACE="$DATASET"
+
+if [[ "$INPUT_MODE" == "dataset" ]]; then
+    echo "============================================================"
+    echo "РЕЖИМ: ГОТОВИЙ ДАТАСЕТ (INPUT_MODE=dataset)"
+    echo "Вихідний датасет: $SOURCE_DATASET"
+    echo "============================================================"
+
+    # Якщо у вихідному датасеті вже є готова sparse-реконструкція
+    if [[ -d "$SOURCE_DATASET/sparse/0" ]]; then
+        echo "Знайдено готову COLMAP-реконструкцію (sparse/0)!"
+        DATASET="$SOURCE_DATASET"
+        WORKSPACE="$DATASET"
+
+        # Переконуємось, що TXT формат існує
+        if [[ ! -f "$DATASET/sparse/0/cameras.txt" || ! -f "$DATASET/sparse/0/points3D.txt" ]]; then
+            echo "Конвертуємо бінарні файли у TXT..."
+            source "$CONDA_BASE/etc/profile.d/conda.sh"
+            conda activate "$COLMAP_ENV"
+            colmap model_converter \
+                --input_path "$DATASET/sparse/0" \
+                --output_path "$DATASET/sparse/0" \
+                --output_type TXT
+            rm -f "$DATASET/sparse/0"/*.bin
+        fi
+
+        # Якщо є глибинні пріори, стартуємо з Етапу 5, інакше з 4
+        if [[ -d "$DATASET/depth_priors" || -d "$DATASET/depths" || -d "$DATASET/depth_vis" ]]; then
+            echo "Знайдено готові Priors! Пропускаємо ЕТАПИ 1-4, переходимо одразу до ЕТАПУ 5."
+            START_STAGE=5
+        else
+            echo "Потрібні Priors. Стартуємо з ЕТАПУ 4."
+            START_STAGE=4
+        fi
+    else
+        # Тільки зображення
+        echo "Знайдено зображення без COLMAP. Пропускаємо ЕТАП 1, запускаємо з ЕТАПУ 2."
+        DATASET="$DATASETS_ROOT/${NAME}-colmap"
+        WORKSPACE="$DATASET"
+        mkdir -p "$DATASET/input"
+        # Копіюємо/лінком зображення
+        if [[ -d "$SOURCE_DATASET/images" ]]; then
+            cp -r "$SOURCE_DATASET/images"/* "$DATASET/input/" 2>/dev/null || true
+        elif [[ -d "$SOURCE_DATASET/input" ]]; then
+            cp -r "$SOURCE_DATASET/input"/* "$DATASET/input/" 2>/dev/null || true
+        else
+            cp -r "$SOURCE_DATASET"/* "$DATASET/input/" 2>/dev/null || true
+        fi
+        START_STAGE=2
+    fi
+fi
 
 MODEL="$SUGAR_ROOT/output/$NAME"
 MESH="$SUGAR_ROOT/output/${NAME}-mesh"
@@ -105,7 +178,12 @@ fi
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 
 # Не перезаписуємо попередню реконструкцію чи результати.
-for path in "$DATASET" "$MODEL" "$MESH"; do
+CHECK_PATHS=("$MODEL" "$MESH")
+if [[ "$DATASET" != "$SOURCE_DATASET" ]]; then
+    CHECK_PATHS+=("$DATASET")
+fi
+
+for path in "${CHECK_PATHS[@]}"; do
     if [[ -e "$path" ]]; then
         echo "ПОМИЛКА: шлях уже існує:"
         echo "  $path"
@@ -144,6 +222,7 @@ export NUMEXPR_NUM_THREADS=1
 # ЕТАП 1. Витягування кадрів із відео (JPG замість PNG + авто-ліміт кадрів)
 # ------------------------------------------------------------
 
+if (( START_STAGE <= 1 )); then
 echo
 echo "========== ЕТАП 1/5: ВИТЯГУВАННЯ КАДРІВ =========="
 STAGE_START=$SECONDS
@@ -272,11 +351,16 @@ if (( FRAME_COUNT < 2 )); then
 fi
 
 echo "Витягнуто кадрів: $FRAME_COUNT (за $((SECONDS - STAGE_START)) сек)"
+else
+    echo
+    echo "========== ЕТАП 1/5: ВИТЯГУВАННЯ КАДРІВ (ПРОПУЩЕНО) =========="
+fi
 
 # ------------------------------------------------------------
 # ЕТАП 2. COLMAP / GLOMAP (Швидкий SIFT + Sequential Matcher + GLOMAP)
 # ------------------------------------------------------------
 
+if (( START_STAGE <= 2 )); then
 echo
 echo "========== ЕТАП 2/5: COLMAP / GLOMAP RECONSTRUCTION =========="
 STAGE_START=$SECONDS
@@ -385,11 +469,16 @@ if [[ ! -d "$DATASET/distorted/sparse/0" ]]; then
 fi
 
 echo "Реконструкцію завершено за $((SECONDS - STAGE_START)) сек."
+else
+    echo
+    echo "========== ЕТАП 2/5: COLMAP / GLOMAP RECONSTRUCTION (ПРОПУЩЕНО) =========="
+fi
 
 # ------------------------------------------------------------
 # ЕТАП 3. Undistortion (Перевід у Pinhole камери для 2DGS)
 # ------------------------------------------------------------
 
+if (( START_STAGE <= 3 )); then
 echo
 echo "========== ЕТАП 3/5: IMAGE UNDISTORTION =========="
 STAGE_START=$SECONDS
@@ -420,11 +509,16 @@ if (( IMAGE_COUNT < 2 )); then
 fi
 
 echo "Отримано недеформованих зображень: $IMAGE_COUNT (за $((SECONDS - STAGE_START)) сек)"
+else
+    echo
+    echo "========== ЕТАП 3/5: IMAGE UNDISTORTION (ПРОПУЩЕНО) =========="
+fi
 
 # ------------------------------------------------------------
 # ЕТАП 4. Конвертація в TXT та розрахунок Priors
 # ------------------------------------------------------------
 
+if (( START_STAGE <= 4 )); then
 echo
 echo "========== ЕТАП 4/5: КОНВЕРТАЦІЯ У TXT ТА PRIORS =========="
 STAGE_START=$SECONDS
@@ -454,6 +548,10 @@ cd "$SUGAR_ROOT"
 python3 estimate_depth_normal_priors.py -s "$DATASET"
 
 echo "Розрахунок Priors завершено за $((SECONDS - STAGE_START)) сек."
+else
+    echo
+    echo "========== ЕТАП 4/5: КОНВЕРТАЦІЯ У TXT ТА PRIORS (ПРОПУЩЕНО) =========="
+fi
 
 # ------------------------------------------------------------
 # ЕТАП 5. Навчання
