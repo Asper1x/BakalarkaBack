@@ -31,6 +31,12 @@ SEQ_OVERLAP="${SEQ_OVERLAP:-15}"
 FILTER_BLURRY="${FILTER_BLURRY:-1}"
 MASK_FOREGROUND="${MASK_FOREGROUND:-0}"
 
+# LiveView WebSocket Streaming (Етап 5)
+LIVE_STREAM_PACKET="${LIVE_STREAM_PACKET:-}"
+STREAMING_FLAG="${STREAMING_FLAG:-}"
+STREAM_INTERVAL="${STREAM_INTERVAL:-150}"
+JOB_ID="${JOB_ID:-$NAME}"
+
 VIDEO="${1:-}"
 NAME="${2:-}"
 
@@ -528,6 +534,20 @@ echo "  sdf_trunc   = $SDF_TRUNC (5 * voxel_size)"
 
 # Зберігаємо лише фінальну ітерацію (--save_iterations "$ITERATIONS"),
 # щоб не витрачати час на запис гігабайтних PLY-файлів на 1 та 7000 ітераціях.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+
+# Якщо передано LIVE_STREAM_PACKET, додаємо параметри стримінгу для train.py
+STREAM_ARGS=()
+if [[ -n "$LIVE_STREAM_PACKET" ]]; then
+    STREAM_ARGS+=(
+        --live_stream_packet "$LIVE_STREAM_PACKET"
+        --streaming_flag "$STREAMING_FLAG"
+        --stream_interval "$STREAM_INTERVAL"
+        --job_id "$JOB_ID"
+    )
+fi
+
 python3 train.py \
     -s "$DATASET" \
     -m "$MODEL/" \
@@ -543,6 +563,7 @@ python3 train.py \
     --voxel_size "$VOXEL_SIZE" \
     --sdf_trunc "$SDF_TRUNC" \
     --depth_trunc "$DEPTH_TRUNC" \
+    "${STREAM_ARGS[@]}" \
     -o "$MESH"
 
 echo "Навчання завершено за $((SECONDS - STAGE_START)) сек."

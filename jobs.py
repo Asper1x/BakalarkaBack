@@ -95,6 +95,14 @@ class Job:
         return config.UPLOADS_DIR / f"{self.id}_gpu_history.csv"
 
     @property
+    def streaming_flag_path(self) -> Path:
+        return config.UPLOADS_DIR / f"{self.id}.streaming_clients"
+
+    @property
+    def live_packet_path(self) -> Path:
+        return config.UPLOADS_DIR / f"{self.id}_live_stream.bin"
+
+    @property
     def has_cameras(self) -> bool:
         if (self.model_dir / "cameras.json").is_file():
             return True
@@ -115,6 +123,7 @@ class Job:
         data["artifacts"] = artifacts
         data["has_cameras"] = self.has_cameras
         data["has_sparse_cloud"] = self.has_sparse_cloud
+        data["is_streaming"] = self.live_packet_path.is_file()
 
         grouped = self.grouped_artifacts(artifacts)
         data["step1_artifact"] = grouped["step1_artifact"]
@@ -298,6 +307,9 @@ class JobManager:
             f"VIDEO_RESOLUTION={shlex.quote(job.video_resolution)} "
             f"FILTER_BLURRY={'1' if job.filter_blurry else '0'} "
             f"MASK_FOREGROUND={'1' if job.mask_foreground else '0'} "
+            f"LIVE_STREAM_PACKET={shlex.quote(str(job.live_packet_path))} "
+            f"STREAMING_FLAG={shlex.quote(str(job.streaming_flag_path))} "
+            f"JOB_ID={shlex.quote(job.id)} "
             f"{shlex.quote(str(config.SCRIPT_PATH))} "
             f"{shlex.quote(job.video_path)} "
             f"{shlex.quote(job.name)}\n"
@@ -542,6 +554,12 @@ class JobManager:
             job.stage_description = "Cancelled via scancel"
             job.finished_at = datetime.now(timezone.utc).isoformat()
             self._save_state()
+
+        # Clean up streaming flags and live packet files
+        if job.streaming_flag_path.exists():
+            job.streaming_flag_path.unlink(missing_ok=True)
+        if job.live_packet_path.exists():
+            job.live_packet_path.unlink(missing_ok=True)
 
         return job
 

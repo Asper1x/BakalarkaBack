@@ -66,3 +66,4 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 - `GET /jobs/{job_id}/result` — Download the primary generated 3D mesh/model file (`sugarfine_*.obj`).
 - `GET /jobs/{job_id}/files/{artifact_path}` — Download a specific output artifact.
 - `DELETE /jobs/{job_id}` — Cancel a queued or running Slurm job via `scancel`.
+- `WS /ws/jobs/{job_id}/stream` — Live in-memory binary WebSocket stream (Variant 3) pushing top-65,536 Gaussians (positions + RGB) at ~983 KB/packet during training. Runs at 0% overhead when no client is connected.

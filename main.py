@@ -2,13 +2,14 @@ from pathlib import Path
 import shutil
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
 import config
 from jobs import JobStatus, job_manager
+from streamer import stream_hub
 
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
@@ -387,3 +388,60 @@ async def cancel_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     return job.to_dict()
+
+
+@app.websocket("/ws/jobs/{job_id}/stream")
+async def websocket_stream_endpoint(websocket: WebSocket, job_id: str):
+    """
+    Live binary WebSocket stream for 3D Gaussian Splatting view during training.
+    Pushes ~983 KB binary packets: [Header: 16B | Pos: K*12B | RGB: K*3B]
+    """
+    await websocket.accept()
+    job = await job_manager.get_job(job_id)
+    if not job:
+        await websocket.close(code=4004, reason="Job not found")
+        return
+
+    await stream_hub.register_client(job_id, websocket)
+
+    import asyncio
+    packet_path = job.live_packet_path
+    last_mtime = 0.0
+
+    async def sender_task():
+        nonlocal last_mtime
+        while True:
+            try:
+                if packet_path.is_file():
+                    stat = packet_path.stat()
+                    if stat.st_mtime > last_mtime:
+                        last_mtime = stat.st_mtime
+                        packet_data = packet_path.read_bytes()
+                        if len(packet_data) >= 16:
+                            await websocket.send_bytes(packet_data)
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                break
+
+    task = asyncio.create_task(sender_task())
+
+    try:
+        while True:
+            # Keep socket open and respond to client messages / pings
+            msg = await websocket.receive_text()
+            if msg == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await stream_hub.unregister_client(job_id, websocket)
+
