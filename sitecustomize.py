@@ -14,7 +14,7 @@ if live_packet:
             job_id=os.getenv("JOB_ID"),
             output_packet_path=live_packet,
             streaming_flag_path=os.getenv("STREAMING_FLAG"),
-            stream_interval=int(os.getenv("STREAM_INTERVAL", "150"))
+            stream_interval=int(os.getenv("STREAM_INTERVAL", "15"))
         )
 
         import builtins

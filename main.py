@@ -121,6 +121,7 @@ async def create_job(
     video_resolution: str = Form(config.DEFAULT_VIDEO_RESOLUTION, description="Frame scale resolution, e.g. 1920x1080"),
     filter_blurry: bool = Form(config.DEFAULT_FILTER_BLURRY, description="Laplacian sharpness frame filtering in Stage 1"),
     mask_foreground: bool = Form(config.DEFAULT_MASK_FOREGROUND, description="Optional foreground masking (rembg) in Stage 1"),
+    stream_interval: int = Form(15, ge=1, le=1000, description="Iterations between live 3DGS stream packet frames"),
 ):
     if input_mode not in ("video", "dataset"):
         raise HTTPException(status_code=400, detail="input_mode must be 'video' or 'dataset'.")
@@ -157,6 +158,7 @@ async def create_job(
             video_resolution=video_resolution,
             filter_blurry=filter_blurry,
             mask_foreground=mask_foreground,
+            stream_interval=stream_interval,
         )
         return job.to_dict()
     except (ValueError, FileNotFoundError) as exc:
@@ -474,25 +476,32 @@ async def websocket_stream_endpoint(websocket: WebSocket, job_id: str):
     await stream_hub.register_client(job_id, websocket)
 
     import asyncio
+    import struct
+    from streamer import MAGIC_HEADER
+
     packet_path = job.live_packet_path
     last_mtime = 0.0
+    last_iteration = -1
 
     async def sender_task():
-        nonlocal last_mtime
+        nonlocal last_mtime, last_iteration
         while True:
             try:
                 if packet_path.is_file():
                     stat = packet_path.stat()
                     if stat.st_mtime > last_mtime:
-                        last_mtime = stat.st_mtime
                         packet_data = packet_path.read_bytes()
                         if len(packet_data) >= 16:
-                            await websocket.send_bytes(packet_data)
-                await asyncio.sleep(0.05)
+                            magic, it, count, loss = struct.unpack("<IIIf", packet_data[:16])
+                            if magic == MAGIC_HEADER and it != last_iteration and count > 0:
+                                last_mtime = stat.st_mtime
+                                last_iteration = it
+                                await websocket.send_bytes(packet_data)
+                await asyncio.sleep(0.03)
             except asyncio.CancelledError:
                 break
             except Exception:
-                break
+                await asyncio.sleep(0.04)
 
     task = asyncio.create_task(sender_task())
 

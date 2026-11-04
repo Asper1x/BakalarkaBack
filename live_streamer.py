@@ -30,7 +30,7 @@ class LiveStreamer:
         elif env_interval and env_interval.isdigit():
             self.stream_interval = int(env_interval)
         else:
-            self.stream_interval = 150
+            self.stream_interval = 15
 
         packet_p = output_packet_path or os.getenv("LIVE_STREAM_PACKET")
         self.output_packet_path = Path(packet_p) if packet_p else None
@@ -99,11 +99,15 @@ class LiveStreamer:
                 sampled_rgb = (torch.clamp(rgb_float, 0.0, 1.0) * 255.0).to(torch.uint8).contiguous()
 
                 # 5. Non-blocking asynchronous CUDA-to-Host transfer using pinned memory
-                with torch.cuda.stream(self.stream):
-                    self.pinned_xyz[:k].copy_(sampled_xyz, non_blocking=True)
-                    self.pinned_rgb[:k].copy_(sampled_rgb, non_blocking=True)
-
-                self.stream.synchronize()
+                if self.stream is not None:
+                    self.stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.stream):
+                        self.pinned_xyz[:k].copy_(sampled_xyz, non_blocking=True)
+                        self.pinned_rgb[:k].copy_(sampled_rgb, non_blocking=True)
+                    self.stream.synchronize()
+                else:
+                    self.pinned_xyz[:k].copy_(sampled_xyz)
+                    self.pinned_rgb[:k].copy_(sampled_rgb)
 
                 xyz_bytes = self.pinned_xyz[:k].numpy().tobytes()
                 rgb_bytes = self.pinned_rgb[:k].numpy().tobytes()

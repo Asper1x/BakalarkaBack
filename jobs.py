@@ -54,6 +54,7 @@ class Job:
     video_resolution: str = config.DEFAULT_VIDEO_RESOLUTION
     filter_blurry: bool = config.DEFAULT_FILTER_BLURRY
     mask_foreground: bool = config.DEFAULT_MASK_FOREGROUND
+    stream_interval: int = 15
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -138,6 +139,7 @@ class Job:
         data["dataset_name"] = self.dataset_name
         data["start_stage"] = self.start_stage
         data["skipped_stages"] = self.skipped_stages
+        data["stream_interval"] = self.stream_interval
 
         grouped = self.grouped_artifacts(artifacts)
         data["step1_artifact"] = grouped["step1_artifact"]
@@ -326,6 +328,7 @@ class JobManager:
             f"START_STAGE={job.start_stage} "
             f"LIVE_STREAM_PACKET={shlex.quote(str(job.live_packet_path))} "
             f"STREAMING_FLAG={shlex.quote(str(job.streaming_flag_path))} "
+            f"STREAM_INTERVAL={job.stream_interval} "
             f"JOB_ID={shlex.quote(job.id)} "
             f"{shlex.quote(str(config.SCRIPT_PATH))} "
             f"{shlex.quote(job.video_path or '')} "
@@ -344,6 +347,7 @@ class JobManager:
         video_resolution: str = config.DEFAULT_VIDEO_RESOLUTION,
         filter_blurry: bool = config.DEFAULT_FILTER_BLURRY,
         mask_foreground: bool = config.DEFAULT_MASK_FOREGROUND,
+        stream_interval: int = 15,
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         if project_name:
@@ -412,6 +416,7 @@ class JobManager:
             video_resolution=video_resolution,
             filter_blurry=filter_blurry,
             mask_foreground=mask_foreground,
+            stream_interval=stream_interval,
         )
 
         slurm_content = self._build_slurm_script(job)
