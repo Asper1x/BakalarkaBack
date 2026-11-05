@@ -65,10 +65,31 @@ class Job:
     def dataset_dir(self) -> Path:
         if self.input_mode == "dataset" and self.source_dataset_path:
             p = Path(self.source_dataset_path)
-            # If the source dataset already has sparse/0, train_video.sh uses it directly
-            if (p / "sparse" / "0").is_dir():
+            # If the source dataset already has sparse/0 or images, use it directly
+            if (p / "sparse" / "0").is_dir() or (p / "images").is_dir() or (p / "input").is_dir():
                 return p
-        return config.DATASETS_ROOT / f"{self.name}-colmap"
+
+        # 1. Check video dataset directory created by train_video.sh ($DATASETS_ROOT/${NAME}-colmap-video)
+        cand_video = config.DATASETS_ROOT / f"{self.name}-colmap-video"
+        if cand_video.is_dir():
+            return cand_video
+
+        # 2. Check standard colmap directory ($DATASETS_ROOT/${NAME}-colmap)
+        cand_colmap = config.DATASETS_ROOT / f"{self.name}-colmap"
+        if cand_colmap.is_dir():
+            return cand_colmap
+
+        # 3. Check plain name in DATASETS_ROOT
+        cand_plain = config.DATASETS_ROOT / self.name
+        if cand_plain.is_dir():
+            return cand_plain
+
+        # 4. Fallback to source dataset path if it exists
+        if self.source_dataset_path and Path(self.source_dataset_path).is_dir():
+            return Path(self.source_dataset_path)
+
+        # Default fallback
+        return cand_video if self.input_mode == "video" else cand_colmap
 
     @property
     def model_dir(self) -> Path:
@@ -1073,13 +1094,17 @@ class JobManager:
 
     def _find_modality_dir(self, dataset_dir: Path, modality: str) -> Optional[Path]:
         cache_key = (str(dataset_dir), modality)
-        if cache_key in self._modality_dir_cache:
-            cached = self._modality_dir_cache[cache_key]
-            if cached is None or cached.is_dir():
-                return cached
+        cached = self._modality_dir_cache.get(cache_key)
+        if cached is not None and cached.is_dir():
+            return cached
 
         candidates = {
-            "rgb": ["images", "input"],
+            "rgb": [
+                "images",
+                "input",
+                "distorted/images",
+                "distorted/input",
+            ],
             "depth": [
                 "depths_vis",
                 "depth_vis",
@@ -1136,7 +1161,8 @@ class JobManager:
                 except Exception:
                     pass
 
-        self._modality_dir_cache[cache_key] = found_dir
+        if found_dir is not None and found_dir.is_dir():
+            self._modality_dir_cache[cache_key] = found_dir
         return found_dir
 
     def get_frames_info(self, job: Job) -> dict:
@@ -1156,11 +1182,19 @@ class JobManager:
         source_dir = rgb_dir or depth_dir or normal_dir
         if source_dir:
             try:
-                frames = sorted(
+                img_frames = sorted(
                     f.name
                     for f in source_dir.iterdir()
                     if f.is_file() and f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
                 )
+                if img_frames:
+                    frames = img_frames
+                else:
+                    frames = sorted(
+                        f"{f.stem}.png"
+                        for f in source_dir.iterdir()
+                        if f.is_file() and f.suffix.lower() == ".npy"
+                    )
             except Exception:
                 pass
 
