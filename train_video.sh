@@ -133,16 +133,6 @@ if [[ "$INPUT_MODE" == "dataset" ]]; then
         echo "Знайдено зображення без COLMAP. Пропускаємо ЕТАП 1, запускаємо з ЕТАПУ 2."
         DATASET="$DATASETS_ROOT/${NAME}-colmap"
         WORKSPACE="$DATASET"
-        rm -rf "$DATASET"
-        mkdir -p "$DATASET/input"
-        # Копіюємо/лінком зображення
-        if [[ -d "$SOURCE_DATASET/images" ]]; then
-            cp -r "$SOURCE_DATASET/images"/* "$DATASET/input/" 2>/dev/null || true
-        elif [[ -d "$SOURCE_DATASET/input" ]]; then
-            cp -r "$SOURCE_DATASET/input"/* "$DATASET/input/" 2>/dev/null || true
-        else
-            cp -r "$SOURCE_DATASET"/* "$DATASET/input/" 2>/dev/null || true
-        fi
         START_STAGE=2
     fi
 fi
@@ -195,7 +185,19 @@ for path in "${CHECK_PATHS[@]}"; do
     fi
 done
 
+# Підготовка робочих директорій після перевірки
 mkdir -p "$DATASET/input" "$(dirname "$MODEL")"
+
+if [[ "$INPUT_MODE" == "dataset" && "$START_STAGE" -eq 2 ]]; then
+    echo "Копіюємо зображення у $DATASET/input/..."
+    if [[ -d "$SOURCE_DATASET/images" ]]; then
+        cp -r "$SOURCE_DATASET/images"/* "$DATASET/input/" 2>/dev/null || true
+    elif [[ -d "$SOURCE_DATASET/input" ]]; then
+        cp -r "$SOURCE_DATASET/input"/* "$DATASET/input/" 2>/dev/null || true
+    else
+        cp -r "$SOURCE_DATASET"/* "$DATASET/input/" 2>/dev/null || true
+    fi
+fi
 touch "$LOG"
 
 exec > >(tee -a "$LOG") 2>&1
