@@ -256,6 +256,8 @@ class Job:
 class JobManager:
     def __init__(self) -> None:
         self.jobs: dict[str, Job] = {}
+        self._modality_dir_cache: dict[tuple[str, str], Optional[Path]] = {}
+        self._frame_file_cache: dict[tuple[str, str, str, Optional[int]], Optional[Path]] = {}
         self._load_state()
 
     def _load_state(self) -> None:
@@ -1069,8 +1071,13 @@ class JobManager:
     # 3. Multi-Modal Frame & Prior Inspector (RGB | Depth | Normal)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _find_modality_dir(dataset_dir: Path, modality: str) -> Optional[Path]:
+    def _find_modality_dir(self, dataset_dir: Path, modality: str) -> Optional[Path]:
+        cache_key = (str(dataset_dir), modality)
+        if cache_key in self._modality_dir_cache:
+            cached = self._modality_dir_cache[cache_key]
+            if cached is None or cached.is_dir():
+                return cached
+
         candidates = {
             "rgb": ["images", "input"],
             "depth": [
@@ -1095,24 +1102,42 @@ class JobManager:
         }.get(modality, [])
 
         valid_exts = {".png", ".jpg", ".jpeg", ".webp", ".npy"}
+        found_dir: Optional[Path] = None
+
         # Prefer directories containing directly renderable images first, then .npy arrays
         for prefer_img_only in (True, False):
+            if found_dir is not None:
+                break
             exts = {".png", ".jpg", ".jpeg", ".webp"} if prefer_img_only else valid_exts
             for name in candidates:
                 d = dataset_dir / name
                 if d.is_dir():
-                    for f in d.iterdir():
-                        if f.is_file() and f.suffix.lower() in exts:
-                            return d
+                    try:
+                        for f in d.iterdir():
+                            if f.is_file() and f.suffix.lower() in exts:
+                                found_dir = d
+                                break
+                    except Exception:
+                        pass
+                    if found_dir is not None:
+                        break
 
             # Also scan one level of subdirectories for any folder matching modality keyword
-            if modality in ("depth", "normal") and dataset_dir.is_dir():
-                for sub in sorted(dataset_dir.iterdir()):
-                    if sub.is_dir() and modality in sub.name.lower():
-                        for f in sub.iterdir():
-                            if f.is_file() and f.suffix.lower() in exts:
-                                return sub
-        return None
+            if found_dir is None and modality in ("depth", "normal") and dataset_dir.is_dir():
+                try:
+                    for sub in sorted(dataset_dir.iterdir()):
+                        if sub.is_dir() and modality in sub.name.lower():
+                            for f in sub.iterdir():
+                                if f.is_file() and f.suffix.lower() in exts:
+                                    found_dir = sub
+                                    break
+                            if found_dir is not None:
+                                break
+                except Exception:
+                    pass
+
+        self._modality_dir_cache[cache_key] = found_dir
+        return found_dir
 
     def get_frames_info(self, job: Job) -> dict:
         dataset_dir = job.dataset_dir
@@ -1130,11 +1155,14 @@ class JobManager:
         frames: list[str] = []
         source_dir = rgb_dir or depth_dir or normal_dir
         if source_dir:
-            frames = sorted(
-                f.name
-                for f in source_dir.iterdir()
-                if f.is_file() and f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
-            )
+            try:
+                frames = sorted(
+                    f.name
+                    for f in source_dir.iterdir()
+                    if f.is_file() and f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+                )
+            except Exception:
+                pass
 
         available = {
             "rgb": rgb_dir is not None,
@@ -1159,8 +1187,13 @@ class JobManager:
         }
 
     @staticmethod
-    def _convert_npy_to_png(npy_path: Path, modality: str, out_png: Path) -> Optional[Path]:
-        """Convert a Metric3D depth or normal .npy array into a cached PNG visualization."""
+    def _convert_npy_to_png(
+        npy_path: Path,
+        modality: str,
+        out_img: Path,
+        max_dim: Optional[int] = None,
+    ) -> Optional[Path]:
+        """Convert a Metric3D depth or normal .npy array into a high-speed cached JPEG/PNG visualization."""
         try:
             import numpy as np
             from PIL import Image
@@ -1171,6 +1204,8 @@ class JobManager:
                 arr = np.transpose(arr, (1, 2, 0))
             arr = np.squeeze(arr)
 
+            out_img.parent.mkdir(parents=True, exist_ok=True)
+
             if modality == "normal" and arr.ndim == 3 and arr.shape[2] >= 3:
                 norm_rgb = arr[:, :, :3].astype(np.float32)
                 if norm_rgb.min() < -0.05:
@@ -1178,8 +1213,21 @@ class JobManager:
                 elif norm_rgb.max() <= 1.05:
                     norm_rgb = norm_rgb * 255.0
                 img_u8 = np.clip(norm_rgb, 0, 255).astype(np.uint8)
-                Image.fromarray(img_u8).save(str(out_png))
-                return out_png
+                im = Image.fromarray(img_u8)
+                if max_dim:
+                    w, h = im.size
+                    if max(w, h) > max_dim:
+                        scale = max_dim / max(w, h)
+                        nw = max(16, int(round(w * scale)))
+                        nh = max(16, int(round(h * scale)))
+                        im = im.resize((nw, nh), Image.Resampling.BILINEAR)
+
+                save_format = "JPEG" if out_img.suffix.lower() in (".jpg", ".jpeg") else "PNG"
+                if save_format == "JPEG":
+                    im.save(str(out_img), format="JPEG", quality=85)
+                else:
+                    im.save(str(out_img))
+                return out_img
 
             # Depth or single-channel array -> normalize and apply magma/inferno-style RGB lut
             if arr.ndim == 3:
@@ -1188,8 +1236,17 @@ class JobManager:
             valid = np.isfinite(d)
             if not np.any(valid):
                 return None
-            lo = float(np.percentile(d[valid], 2))
-            hi = float(np.percentile(d[valid], 98))
+
+            valid_vals = d[valid]
+            # Fast percentiles: subsample array to ~25k items to avoid sorting millions of floats (1ms vs 300ms)
+            if valid_vals.size > 25000:
+                step = max(1, valid_vals.size // 25000)
+                sample = valid_vals[::step]
+            else:
+                sample = valid_vals
+
+            lo = float(np.percentile(sample, 2))
+            hi = float(np.percentile(sample, 98))
             t = np.clip((d - lo) / max(1e-6, hi - lo), 0.0, 1.0)
             # Invert so closer objects are brighter/warmer
             t = 1.0 - t
@@ -1197,16 +1254,65 @@ class JobManager:
             g = np.clip(255.0 * np.power(t, 1.45), 0, 255).astype(np.uint8)
             b = np.clip(255.0 * (0.65 * (1.0 - t) + 0.35 * np.power(t, 2.5)), 0, 255).astype(np.uint8)
             rgb = np.stack([r, g, b], axis=-1)
-            Image.fromarray(rgb).save(str(out_png))
-            return out_png
+            im = Image.fromarray(rgb)
+            if max_dim:
+                w, h = im.size
+                if max(w, h) > max_dim:
+                    scale = max_dim / max(w, h)
+                    nw = max(16, int(round(w * scale)))
+                    nh = max(16, int(round(h * scale)))
+                    im = im.resize((nw, nh), Image.Resampling.BILINEAR)
+
+            save_format = "JPEG" if out_img.suffix.lower() in (".jpg", ".jpeg") else "PNG"
+            if save_format == "JPEG":
+                im.save(str(out_img), format="JPEG", quality=85)
+            else:
+                im.save(str(out_img))
+            return out_img
         except Exception:
             return None
 
-    def resolve_frame_file(self, job: Job, modality: str, filename: str) -> Optional[Path]:
+    @staticmethod
+    def _get_or_create_thumbnail(source_path: Path, thumb_path: Path, max_dim: int) -> Optional[Path]:
+        """Produce and cache a lightweight JPEG thumbnail from any source image."""
+        try:
+            from PIL import Image
+
+            if thumb_path.is_file() and thumb_path.stat().st_mtime >= source_path.stat().st_mtime:
+                return thumb_path
+
+            thumb_path.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(str(source_path)) as im:
+                im = im.convert("RGB")
+                w, h = im.size
+                if max(w, h) > max_dim:
+                    scale = max_dim / max(w, h)
+                    nw = max(16, int(round(w * scale)))
+                    nh = max(16, int(round(h * scale)))
+                    thumb = im.resize((nw, nh), Image.Resampling.BILINEAR)
+                else:
+                    thumb = im
+                thumb.save(str(thumb_path), format="JPEG", quality=82)
+                return thumb_path
+        except Exception:
+            return source_path
+
+    def resolve_frame_file(
+        self,
+        job: Job,
+        modality: str,
+        filename: str,
+        max_dim: Optional[int] = None,
+    ) -> Optional[Path]:
         if modality not in ("rgb", "depth", "normal"):
             return None
         if "/" in filename or "\\" in filename or ".." in filename:
             return None
+
+        cache_key = (job.id, modality, filename, max_dim)
+        cached = self._frame_file_cache.get(cache_key)
+        if cached is not None and cached.is_file():
+            return cached
 
         dataset_root = job.dataset_dir.resolve()
         if not dataset_root.is_dir():
@@ -1220,45 +1326,71 @@ class JobManager:
         if not mod_dir_resolved.is_relative_to(dataset_root):
             return None
 
-        # Exact match first (only for direct image files)
+        stem = Path(filename).stem
+        resolved_full: Optional[Path] = None
+
+        # 1. Exact match first (direct image file)
         exact = (mod_dir_resolved / filename).resolve()
         if (
             exact.is_relative_to(dataset_root)
             and exact.is_file()
             and exact.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
         ):
-            return exact
+            resolved_full = exact
 
-        # Fallback: match by stem (e.g. if RGB is 0001.png and depth is 0001.jpg or 0001_depth.png)
-        stem = Path(filename).stem
-        for ext in (".png", ".jpg", ".jpeg", ".webp"):
-            for candidate_name in (
-                f"{stem}{ext}",
-                f"{stem}_{modality}{ext}",
-                f"{stem}_vis{ext}",
-                f"{stem}_normal{ext}",
-                f"{stem}_depth{ext}",
+        # 2. Match by stem (e.g. RGB is 0001.png, depth is 0001.jpg or 0001_depth.png)
+        if resolved_full is None:
+            for ext in (".jpg", ".jpeg", ".png", ".webp"):
+                for candidate_name in (
+                    f"{stem}{ext}",
+                    f"{stem}_{modality}{ext}",
+                    f"{stem}_vis{ext}",
+                    f"{stem}_normal{ext}",
+                    f"{stem}_depth{ext}",
+                ):
+                    cand = (mod_dir_resolved / candidate_name).resolve()
+                    if cand.is_relative_to(dataset_root) and cand.is_file():
+                        resolved_full = cand
+                        break
+                if resolved_full is not None:
+                    break
+
+        # 3. Match Metric3D .npy tensors -> convert to cached visualization
+        if resolved_full is None:
+            for candidate_npy in (
+                f"{stem}.npy",
+                f"{Path(filename).name}.npy",
+                f"{stem}_{modality}.npy",
             ):
-                cand = (mod_dir_resolved / candidate_name).resolve()
-                if cand.is_relative_to(dataset_root) and cand.is_file():
-                    return cand
+                npy_cand = (mod_dir_resolved / candidate_npy).resolve()
+                if npy_cand.is_relative_to(dataset_root) and npy_cand.is_file():
+                    cached_jpg = config.UPLOADS_DIR / f"{job.id}_{modality}_{stem}.jpg"
+                    cached_png = config.UPLOADS_DIR / f"{job.id}_{modality}_{stem}.png"
+                    if cached_jpg.is_file() and cached_jpg.stat().st_mtime >= npy_cand.stat().st_mtime:
+                        resolved_full = cached_jpg
+                        break
+                    if cached_png.is_file() and cached_png.stat().st_mtime >= npy_cand.stat().st_mtime:
+                        resolved_full = cached_png
+                        break
 
-        # Fallback 2: if Metric3D stored .npy tensors, convert to a cached .png on the fly
-        for candidate_npy in (
-            f"{stem}.npy",
-            f"{Path(filename).name}.npy",
-            f"{stem}_{modality}.npy",
-        ):
-            npy_cand = (mod_dir_resolved / candidate_npy).resolve()
-            if npy_cand.is_relative_to(dataset_root) and npy_cand.is_file():
-                cached_png = config.UPLOADS_DIR / f"{job.id}_{modality}_{stem}.png"
-                if cached_png.is_file() and cached_png.stat().st_mtime >= npy_cand.stat().st_mtime:
-                    return cached_png
-                converted = self._convert_npy_to_png(npy_cand, modality, cached_png)
-                if converted is not None and converted.is_file():
-                    return converted
+                    converted = self._convert_npy_to_png(npy_cand, modality, cached_jpg)
+                    if converted is not None and converted.is_file():
+                        resolved_full = converted
+                        break
 
-        return None
+        if resolved_full is None:
+            return None
+
+        # If a thumbnail / downscale dimension is requested, produce and cache it
+        if max_dim:
+            thumb_path = config.UPLOADS_DIR / f"thumb_{job.id}_{modality}_{stem}_{max_dim}.jpg"
+            thumb = self._get_or_create_thumbnail(resolved_full, thumb_path, max_dim)
+            if thumb and thumb.is_file():
+                self._frame_file_cache[cache_key] = thumb
+                return thumb
+
+        self._frame_file_cache[cache_key] = resolved_full
+        return resolved_full
 
     # ------------------------------------------------------------------
     # 4. Live Training Loss & GPU History Charts

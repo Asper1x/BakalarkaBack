@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 import shutil
 from typing import Optional
@@ -260,7 +261,13 @@ async def get_job_frames(job_id: str):
 
 
 @app.get("/jobs/{job_id}/frames/{modality}/{filename}")
-async def get_job_frame_image(job_id: str, modality: str, filename: str):
+async def get_job_frame_image(
+    job_id: str,
+    modality: str,
+    filename: str,
+    thumbnail: bool = Query(False, description="Whether to serve a lightweight preview thumbnail"),
+    max_dim: Optional[int] = Query(None, ge=64, le=3840, description="Max dimension for downscaling"),
+):
     """Return the image file for a specific frame and modality (rgb, depth, normal)."""
     if modality not in ("rgb", "depth", "normal"):
         raise HTTPException(status_code=400, detail="Modality must be one of: rgb, depth, normal.")
@@ -269,11 +276,33 @@ async def get_job_frame_image(job_id: str, modality: str, filename: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
 
-    file_path = job_manager.resolve_frame_file(job, modality=modality, filename=filename)
-    if not file_path:
+    target_dim = max_dim
+    if thumbnail and not target_dim:
+        target_dim = 480
+
+    file_path = await asyncio.to_thread(
+        job_manager.resolve_frame_file,
+        job=job,
+        modality=modality,
+        filename=filename,
+        max_dim=target_dim,
+    )
+    if not file_path or not file_path.is_file():
         raise HTTPException(status_code=404, detail=f"Frame '{filename}' for modality '{modality}' not found.")
 
-    return FileResponse(path=file_path)
+    suffix = file_path.suffix.lower()
+    media_type = "image/jpeg" if suffix in (".jpg", ".jpeg") else "image/png"
+    if suffix == ".webp":
+        media_type = "image/webp"
+
+    return FileResponse(
+        path=file_path,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=86400, immutable",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 @app.get("/jobs/{job_id}/telemetry")
