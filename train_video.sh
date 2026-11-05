@@ -133,6 +133,7 @@ if [[ "$INPUT_MODE" == "dataset" ]]; then
         echo "Знайдено зображення без COLMAP. Пропускаємо ЕТАП 1, запускаємо з ЕТАПУ 2."
         DATASET="$DATASETS_ROOT/${NAME}-colmap"
         WORKSPACE="$DATASET"
+        rm -rf "$DATASET"
         mkdir -p "$DATASET/input"
         # Копіюємо/лінком зображення
         if [[ -d "$SOURCE_DATASET/images" ]]; then

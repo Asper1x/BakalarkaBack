@@ -67,7 +67,7 @@ class Job:
             # If the source dataset already has sparse/0, train_video.sh uses it directly
             if (p / "sparse" / "0").is_dir():
                 return p
-        return config.DATASETS_ROOT / f"{self.name}-colmap-video"
+        return config.DATASETS_ROOT / f"{self.name}-colmap"
 
     @property
     def model_dir(self) -> Path:
