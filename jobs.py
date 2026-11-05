@@ -55,6 +55,7 @@ class Job:
     filter_blurry: bool = config.DEFAULT_FILTER_BLURRY
     mask_foreground: bool = config.DEFAULT_MASK_FOREGROUND
     stream_interval: int = 15
+    scene_type: str = "object"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -137,6 +138,7 @@ class Job:
         data["is_streaming"] = self.live_packet_path.is_file()
         data["input_mode"] = self.input_mode
         data["dataset_name"] = self.dataset_name
+        data["scene_type"] = self.scene_type
         data["start_stage"] = self.start_stage
         data["skipped_stages"] = self.skipped_stages
         data["stream_interval"] = self.stream_interval
@@ -326,6 +328,7 @@ class JobManager:
             f"INPUT_MODE={shlex.quote(job.input_mode)} "
             f"SOURCE_DATASET={shlex.quote(job.source_dataset_path or '')} "
             f"START_STAGE={job.start_stage} "
+            f"SCENE_TYPE={shlex.quote(job.scene_type)} "
             f"LIVE_STREAM_PACKET={shlex.quote(str(job.live_packet_path))} "
             f"STREAMING_FLAG={shlex.quote(str(job.streaming_flag_path))} "
             f"STREAM_INTERVAL={job.stream_interval} "
@@ -348,6 +351,7 @@ class JobManager:
         filter_blurry: bool = config.DEFAULT_FILTER_BLURRY,
         mask_foreground: bool = config.DEFAULT_MASK_FOREGROUND,
         stream_interval: int = 15,
+        scene_type: str = "object",
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         if project_name:
@@ -417,6 +421,7 @@ class JobManager:
             filter_blurry=filter_blurry,
             mask_foreground=mask_foreground,
             stream_interval=stream_interval,
+            scene_type=scene_type,
         )
 
         slurm_content = self._build_slurm_script(job)

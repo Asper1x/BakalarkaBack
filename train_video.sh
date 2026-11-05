@@ -44,6 +44,7 @@ NAME="${2:-}"
 INPUT_MODE="${INPUT_MODE:-video}"          # "video" або "dataset"
 SOURCE_DATASET="${SOURCE_DATASET:-}"        # шлях до існуючого датасету
 START_STAGE="${START_STAGE:-1}"             # 1..5
+SCENE_TYPE="${SCENE_TYPE:-object}"          # "object" (default) або "building"
 
 usage() {
     echo "Використання:"
@@ -616,22 +617,51 @@ sleep 1
 # 2. Читаємо рекомендований depth_trunc із логу ("Use at least X.XX for depth_trunc")
 LOG_DEPTH_TRUNC="$(grep -Eo 'Use at least [0-9]+(\.[0-9]+)? for depth_trunc' "$LOG" | tail -n 1 | awk '{print $4}' || true)"
 
-if [[ -n "$LOG_DEPTH_TRUNC" ]]; then
-    DEPTH_TRUNC="$LOG_DEPTH_TRUNC"
+if [[ "$SCENE_TYPE" == "building" ]]; then
+    echo "--- НАЛАШТУВАННЯ ДЛЯ БУДІВЛІ / ФАСАДУ (SCENE_TYPE=building) ---"
+    # Для будівель оптичні промені не сходяться в одній точці, тому обмежуємо depth_trunc,
+    # щоб вокселі не роздувалися до гігантських розмірів:
+    if [[ -n "$LOG_DEPTH_TRUNC" ]] && (( $(echo "$LOG_DEPTH_TRUNC < 18.0" | bc -l 2>/dev/null || echo 0) )); then
+        DEPTH_TRUNC="$LOG_DEPTH_TRUNC"
+    else
+        DEPTH_TRUNC="${DEPTH_TRUNC:-10.0}"
+    fi
+
+    # Висока воксельна роздільність (10 мм) для збереження віконних рам, карнизів та стін
+    VOXEL_SIZE="${VOXEL_SIZE:-0.010}"
+    SDF_TRUNC="${SDF_TRUNC:-0.050}"
+
+    # Затримка прунінгу кластерів (12 000 ітерацій) та м'яка регулярність, щоб не колапсувати сітку на 20%:
+    CLUSTER_PRUNE_ITERS="${CLUSTER_PRUNE_ITERS:-12000}"
+    LAMBDA_DIST="${LAMBDA_DIST:-150}"
+    NUM_CLUSTER="${NUM_CLUSTER:-1}"
+
+    echo "  Параметри для будівлі (Option B):"
+    echo "    depth_trunc = $DEPTH_TRUNC"
+    echo "    voxel_size  = $VOXEL_SIZE (10mm)"
+    echo "    sdf_trunc   = $SDF_TRUNC"
+    echo "    cluster_prune_iterations = $CLUSTER_PRUNE_ITERS"
+    echo "    lambda_dist = $LAMBDA_DIST (Soft Mesh Binding)"
 else
-    DEPTH_TRUNC="${DEPTH_TRUNC:-3.0}"
+    echo "--- НАЛАШТУВАННЯ ДЛЯ ОБ'ЄКТА (SCENE_TYPE=object) ---"
+    if [[ -n "$LOG_DEPTH_TRUNC" ]]; then
+        DEPTH_TRUNC="$LOG_DEPTH_TRUNC"
+    else
+        DEPTH_TRUNC="${DEPTH_TRUNC:-3.0}"
+    fi
+    VOXEL_SIZE="$(awk -v d="$DEPTH_TRUNC" 'BEGIN { printf "%.6f", d / 1000.0 }')"
+    SDF_TRUNC="$(awk -v v="$VOXEL_SIZE" 'BEGIN { printf "%.6f", 5.0 * v }')"
+    CLUSTER_PRUNE_ITERS="${CLUSTER_PRUNE_ITERS:-7000}"
+    LAMBDA_DIST="${LAMBDA_DIST:-1000}"
+    NUM_CLUSTER="${NUM_CLUSTER:-1}"
+
+    echo "Автоматичні TSDF-параметри з логу:"
+    echo "  depth_trunc = $DEPTH_TRUNC"
+    echo "  voxel_size  = $VOXEL_SIZE (depth_trunc / 1000)"
+    echo "  sdf_trunc   = $SDF_TRUNC (5 * voxel_size)"
+    echo "  cluster_prune_iterations = $CLUSTER_PRUNE_ITERS"
+    echo "  lambda_dist = $LAMBDA_DIST"
 fi
-
-# Рахуємо:
-# voxel_size = depth_trunc / 1000
-# sdf_trunc  = 5 * voxel_size
-VOXEL_SIZE="$(awk -v d="$DEPTH_TRUNC" 'BEGIN { printf "%.6f", d / 1000.0 }')"
-SDF_TRUNC="$(awk -v v="$VOXEL_SIZE" 'BEGIN { printf "%.6f", 5.0 * v }')"
-
-echo "Автоматичні TSDF-параметри з логу:"
-echo "  depth_trunc = $DEPTH_TRUNC"
-echo "  voxel_size  = $VOXEL_SIZE (depth_trunc / 1000)"
-echo "  sdf_trunc   = $SDF_TRUNC (5 * voxel_size)"
 
 # Зберігаємо лише фінальну ітерацію (--save_iterations "$ITERATIONS"),
 # щоб не витрачати час на запис гігабайтних PLY-файлів на 1 та 7000 ітераціях.
@@ -652,12 +682,12 @@ python3 train.py \
     --test_iterations -1 \
     --depth_ratio 1.0 \
     -r "$RESOLUTION" \
-    --lambda_dist 1000 \
+    --lambda_dist "$LAMBDA_DIST" \
     --save_iterations "$ITERATIONS" \
     --iterations "$ITERATIONS" \
-    --cluster_prune_iterations 7000 \
+    --cluster_prune_iterations "$CLUSTER_PRUNE_ITERS" \
     --initialization_prior monocular_depth_normal \
-    --num_cluster 1 \
+    --num_cluster "$NUM_CLUSTER" \
     --voxel_size "$VOXEL_SIZE" \
     --sdf_trunc "$SDF_TRUNC" \
     --depth_trunc "$DEPTH_TRUNC" \

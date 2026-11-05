@@ -122,6 +122,7 @@ async def create_job(
     filter_blurry: bool = Form(config.DEFAULT_FILTER_BLURRY, description="Laplacian sharpness frame filtering in Stage 1"),
     mask_foreground: bool = Form(config.DEFAULT_MASK_FOREGROUND, description="Optional foreground masking (rembg) in Stage 1"),
     stream_interval: int = Form(15, ge=1, le=1000, description="Iterations between live 3DGS stream packet frames"),
+    scene_type: str = Form("object", description="Target scene type: 'object' (small asset) or 'building' (architectural facade)"),
 ):
     if input_mode not in ("video", "dataset"):
         raise HTTPException(status_code=400, detail="input_mode must be 'video' or 'dataset'.")
@@ -159,6 +160,7 @@ async def create_job(
             filter_blurry=filter_blurry,
             mask_foreground=mask_foreground,
             stream_interval=stream_interval,
+            scene_type=scene_type,
         )
         return job.to_dict()
     except (ValueError, FileNotFoundError) as exc:
