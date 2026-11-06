@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeo pipefail
 
+# Фіксуємо абсолютний шлях до скрипта та репозиторію BakalarkaBack НА САМОМУ ПОЧАТКУ,
+# ДО будь-яких переходів (cd) в інші директорії
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
 # ============================================================
 # Video -> COLMAP / GLOMAP -> Gaussian Splatting / 2D-SuGaR (Optimized)
 # ============================================================
@@ -665,7 +669,6 @@ fi
 
 # Зберігаємо лише фінальну ітерацію (--save_iterations "$ITERATIONS"),
 # щоб не витрачати час на запис гігабайтних PLY-файлів на 1 та 7000 ітераціях.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
 
 # Експортуємо змінні середовища для streamer, щоб не змінювати CLI-аргументи стороннього train.py

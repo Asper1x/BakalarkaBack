@@ -45,7 +45,10 @@ class LiveStreamer:
         self.pinned_xyz = None
         self.pinned_rgb = None
         self.stream = None
+        self.event = None
         self.has_torch = False
+        self._last_flag_check = 0.0
+        self._has_clients_cached = False
 
         self._init_torch()
 
@@ -60,14 +63,22 @@ class LiveStreamer:
                 self.pinned_xyz = torch.empty((self.max_points, 3), dtype=torch.float32, pin_memory=True)
                 self.pinned_rgb = torch.empty((self.max_points, 3), dtype=torch.uint8, pin_memory=True)
                 self.stream = torch.cuda.Stream()
+                self.event = torch.cuda.Event()
                 self.has_torch = True
         except Exception:
             self.has_torch = False
 
     def has_active_clients(self) -> bool:
-        if self.streaming_flag_path:
-            return self.streaming_flag_path.is_file()
-        return False
+        if not self.streaming_flag_path:
+            return False
+        now = time.time()
+        if now - self._last_flag_check > 1.5:
+            self._last_flag_check = now
+            try:
+                self._has_clients_cached = self.streaming_flag_path.is_file()
+            except Exception:
+                self._has_clients_cached = False
+        return self._has_clients_cached
 
     def step(self, iteration: int, gaussians, loss: float = 0.0):
         if iteration % self.stream_interval != 0:
@@ -98,28 +109,25 @@ class LiveStreamer:
                 rgb_float = 0.5 + 0.28209479177387814 * gaussians.get_features[top_indices, 0, :]
                 sampled_rgb = (torch.clamp(rgb_float, 0.0, 1.0) * 255.0).to(torch.uint8).contiguous()
 
-                # 5. Non-blocking asynchronous CUDA-to-Host transfer using pinned memory
-                if self.stream is not None:
+                # 5. Non-blocking asynchronous CUDA-to-Host transfer using pinned memory & dedicated stream
+                if self.stream is not None and self.event is not None:
                     self.stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.stream):
                         self.pinned_xyz[:k].copy_(sampled_xyz, non_blocking=True)
                         self.pinned_rgb[:k].copy_(sampled_rgb, non_blocking=True)
-                    self.stream.synchronize()
+                    self.event.record(self.stream)
                 else:
                     self.pinned_xyz[:k].copy_(sampled_xyz)
                     self.pinned_rgb[:k].copy_(sampled_rgb)
 
-                xyz_bytes = self.pinned_xyz[:k].numpy().tobytes()
-                rgb_bytes = self.pinned_rgb[:k].numpy().tobytes()
-
-                # Push to single-slot queue (drop policy on backpressure)
+                # Push to single-slot queue WITHOUT blocking the main training loop.
+                # All synchronization and disk writing is deferred to the background worker thread.
                 try:
                     self.frame_queue.put_nowait({
                         "iteration": iteration,
                         "loss": float(loss),
                         "count": k,
-                        "xyz": xyz_bytes,
-                        "rgb": rgb_bytes
+                        "event": self.event if self.stream is not None else None,
                     })
                 except queue.Full:
                     pass
@@ -136,12 +144,21 @@ class LiveStreamer:
                 continue
 
             try:
+                # Synchronize CUDA stream in the background thread (NOT on the training loop thread)
+                event = frame.get("event")
+                if event is not None:
+                    event.synchronize()
+
+                k = frame["count"]
+                xyz_bytes = self.pinned_xyz[:k].numpy().tobytes()
+                rgb_bytes = self.pinned_rgb[:k].numpy().tobytes()
+
                 packet = self._pack_packet(
                     frame["iteration"],
                     frame["loss"],
-                    frame["count"],
-                    frame["xyz"],
-                    frame["rgb"]
+                    k,
+                    xyz_bytes,
+                    rgb_bytes
                 )
                 if self.output_packet_path:
                     tmp_path = self.output_packet_path.with_suffix(".tmp")
