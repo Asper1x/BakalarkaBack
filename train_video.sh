@@ -651,23 +651,34 @@ if [[ "$SCENE_TYPE" == "building" ]]; then
     echo "    lambda_dist = $LAMBDA_DIST (Soft Mesh Binding)"
 else
     echo "--- НАЛАШТУВАННЯ ДЛЯ ОБ'ЄКТА (SCENE_TYPE=object) ---"
-    if [[ -n "$LOG_DEPTH_TRUNC" ]]; then
+    # Для окремих об'єктів (small objects) радіус зйомки не повинен захоплювати дальні стіни кімнати (10-15м),
+    # інакше TSDF-сітка роздувається на всю кімнату, а розмір вокселів стає занадто грубим (>10 мм).
+    # Офіційна рекомендація 2D-SuGaR для об'єктів: depth_trunc = 2.5..3.5, voxel_size = 0.004 (4 мм).
+    if [[ -n "$DEPTH_TRUNC" ]]; then
+        # Користувач задав вручну через змінну середовища
+        :
+    elif [[ -n "$LOG_DEPTH_TRUNC" ]] && (( $(echo "$LOG_DEPTH_TRUNC <= 4.0" | bc -l 2>/dev/null || echo 0) )); then
         DEPTH_TRUNC="$LOG_DEPTH_TRUNC"
     else
-        DEPTH_TRUNC="${DEPTH_TRUNC:-3.0}"
+        # Якщо COLMAP порахував завеликий радіус (наприклад, 13.35 через дальній фон або рух по кімнаті),
+        # обмежуємо об'єктний depth_trunc до 3.0:
+        DEPTH_TRUNC="3.0"
     fi
-    VOXEL_SIZE="$(awk -v d="$DEPTH_TRUNC" 'BEGIN { printf "%.6f", d / 1000.0 }')"
-    SDF_TRUNC="$(awk -v v="$VOXEL_SIZE" 'BEGIN { printf "%.6f", 5.0 * v }')"
+
+    # Висока якість геометрії для об'єктів: 4 мм (0.004) за офіційною рекомендацією 2D-SuGaR
+    VOXEL_SIZE="${VOXEL_SIZE:-0.004}"
+    SDF_TRUNC="${SDF_TRUNC:-$(awk -v v="$VOXEL_SIZE" 'BEGIN { printf "%.6f", 4.0 * v }')}"
     CLUSTER_PRUNE_ITERS="${CLUSTER_PRUNE_ITERS:-7000}"
-    LAMBDA_DIST="${LAMBDA_DIST:-1000}"
+    # Для реальних зйомок об'єктів lambda_dist=200 дає чіткі пласкі поверхні без домінування над кольором і без гальмування
+    LAMBDA_DIST="${LAMBDA_DIST:-200}"
     NUM_CLUSTER="${NUM_CLUSTER:-1}"
 
-    echo "Автоматичні TSDF-параметри з логу:"
-    echo "  depth_trunc = $DEPTH_TRUNC"
-    echo "  voxel_size  = $VOXEL_SIZE (depth_trunc / 1000)"
-    echo "  sdf_trunc   = $SDF_TRUNC (5 * voxel_size)"
+    echo "Параметри для об'єкта (2D-SuGaR):"
+    echo "  depth_trunc = $DEPTH_TRUNC (відсікання фону за межами об'єкта)"
+    echo "  voxel_size  = $VOXEL_SIZE (4 мм деталізація сітки)"
+    echo "  sdf_trunc   = $SDF_TRUNC"
     echo "  cluster_prune_iterations = $CLUSTER_PRUNE_ITERS"
-    echo "  lambda_dist = $LAMBDA_DIST"
+    echo "  lambda_dist = $LAMBDA_DIST (оптимальна регулярність)"
 fi
 
 # Зберігаємо лише фінальну ітерацію (--save_iterations "$ITERATIONS"),
