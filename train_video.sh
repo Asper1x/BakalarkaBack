@@ -23,7 +23,10 @@ MAX_FRAMES="${MAX_FRAMES:-220}"
 # Оскільки використовується monocular_depth_normal prior, 18000-20000 ітерацій
 # дають практично ту саму якість сітки, що й 30000, але на ~35-40% швидше.
 ITERATIONS="${ITERATIONS:-20000}"
-RESOLUTION="${RESOLUTION:-1}"
+# Офіційна рекомендація авторів 2D-SuGaR та 3DGS — RESOLUTION=2 (downsample x2 = 960x540).
+# При RESOLUTION=1 (1080p) растеризується у 4 рази більше пікселів на кожній ітерації,
+# що сповільнює навчання та mesh refinement у 3.5-4 рази без суттєвої різниці в геометрії.
+RESOLUTION="${RESOLUTION:-2}"
 VIDEO_RESOLUTION="${VIDEO_RESOLUTION:-1920x1080}"
 
 # COLMAP GPU / SIFT налаштування
@@ -58,7 +61,7 @@ usage() {
     echo "  $0 ~/videos/stol.mp4 stol"
     echo
     echo "Необов'язкові змінні:"
-    echo "  FPS=6 MAX_FRAMES=220 ITERATIONS=20000 RESOLUTION=1 INPUT_MODE=dataset SOURCE_DATASET=/path/to/dataset"
+    echo "  FPS=6 MAX_FRAMES=220 ITERATIONS=20000 RESOLUTION=2 INPUT_MODE=dataset SOURCE_DATASET=/path/to/dataset"
     exit 1
 }
 
