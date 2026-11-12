@@ -266,8 +266,11 @@ class Job:
         elif self.mesh_path.is_file():
             _add(self.mesh_path)
 
-        # 4. Check model_dir for point_cloud/iteration_*/point_cloud.ply (highest iteration first) and other 3D files
+        # 4. Check model_dir: prioritize triangle meshes (fuse_post.ply, fuse.ply) before raw point_cloud.ply
         if self.model_dir.exists() and self.model_dir.is_dir():
+            for preferred_mesh in ("fuse_post.ply", "fuse.ply"):
+                for f in sorted(self.model_dir.rglob(preferred_mesh)):
+                    _add(f)
             pc_files = list(self.model_dir.glob("point_cloud/iteration_*/point_cloud.ply"))
             pc_files.sort(
                 key=lambda p: int(re.sub(r"\D", "", p.parent.name) or "0"),
