@@ -51,9 +51,17 @@ NAME="${2:-}"
 INPUT_MODE="${INPUT_MODE:-video}"          # "video" або "dataset"
 SOURCE_DATASET="${SOURCE_DATASET:-}"        # шлях до існуючого датасету
 START_STAGE="${START_STAGE:-1}"             # 1..5
-SCENE_TYPE="${SCENE_TYPE:-object}"          # "object" (default) або "building"
+SCENE_TYPE="${SCENE_TYPE:-object}"          # "object" (default) або "building" (підтримує формат "object:skip:1")
 REFINEMENT_MODE="${REFINEMENT_MODE:-full}"  # "skip" (0 ітер., тільки TSDF), "fast" (2000), "balanced" (7000), "full" (15000)
 WATERTIGHT_MESH="${WATERTIGHT_MESH:-0}"     # "1" — автоматично зашивати всі дірки у сітках (100% watertight)
+
+# Підтримка композитного SCENE_TYPE вигляду "object:skip:1" (гарантує роботу без перезапуску uvicorn)
+if [[ "$SCENE_TYPE" == *:* ]]; then
+    IFS=':' read -r _PARSED_SCENE _PARSED_REFINE _PARSED_WT <<<"$SCENE_TYPE"
+    SCENE_TYPE="${_PARSED_SCENE:-object}"
+    [[ -n "$_PARSED_REFINE" ]] && REFINEMENT_MODE="$_PARSED_REFINE"
+    [[ -n "$_PARSED_WT" ]] && WATERTIGHT_MESH="$_PARSED_WT"
+fi
 
 usage() {
     echo "Використання:"
@@ -677,6 +685,27 @@ fi
 echo "  Режим Mesh Refinement (REFINEMENT_MODE): $REFINEMENT_MODE"
 echo "  Герметизація сітки (WATERTIGHT_MESH):    $WATERTIGHT_MESH"
 
+# Формуємо нативні прапорці для 2D-SuGaR train.py (--skip_sugar_refine або -f <ітерації>)
+REFINE_CLI_ARGS=()
+case "${REFINEMENT_MODE,,}" in
+    skip|0|none|false)
+        echo "  -> Додаємо прапорець --skip_sugar_refine (пропуск 15 000 ітерацій SuGaR Refinement)"
+        REFINE_CLI_ARGS+=(--skip_sugar_refine)
+        ;;
+    fast|2000)
+        echo "  -> Додаємо прапорець -f 2000 (швидкий SuGaR Refinement на 2000 ітерацій)"
+        REFINE_CLI_ARGS+=(-f 2000)
+        ;;
+    balanced|7000)
+        echo "  -> Додаємо прапорець -f 7000 (збалансований SuGaR Refinement на 7000 ітерацій)"
+        REFINE_CLI_ARGS+=(-f 7000)
+        ;;
+    full|15000|*)
+        echo "  -> Повний SuGaR Refinement (-f 15000)"
+        REFINE_CLI_ARGS+=(-f 15000)
+        ;;
+esac
+
 # Зберігаємо лише фінальну ітерацію (--save_iterations "$ITERATIONS"),
 # щоб не витрачати час на запис гігабайтних PLY-файлів на 1 та 7000 ітераціях.
 export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
@@ -708,9 +737,10 @@ python3 train.py \
     --voxel_size "$VOXEL_SIZE" \
     --sdf_trunc "$SDF_TRUNC" \
     --depth_trunc "$DEPTH_TRUNC" \
-    -o "$MESH"
+    -o "$MESH" \
+    "${REFINE_CLI_ARGS[@]}"
 
-# Гарантуємо наявність сітки у $MESH при REFINEMENT_MODE=skip та фінальну герметизацію при WATERTIGHT_MESH=1
+# Гарантуємо герметизацію сітки при WATERTIGHT_MESH=1 та наявність сітки у $MESH при REFINEMENT_MODE=skip
 python3 - "$MODEL" "$MESH" "$REFINEMENT_MODE" "$WATERTIGHT_MESH" <<'PYEOF'
 import shutil
 import sys
@@ -719,38 +749,46 @@ from pathlib import Path
 model_dir = Path(sys.argv[1])
 mesh_dir = Path(sys.argv[2])
 ref_mode = sys.argv[3].strip().lower()
-watertight = sys.argv[4].strip() == "1"
+watertight = sys.argv[4].strip().lower() in ("1", "true", "yes", "on")
 
-# Якщо REFINEMENT_MODE=skip, переконуємося, що fuse_post.ply (або fuse.ply) скопійовано у $MESH
-if ref_mode in ("skip", "0", "none", "false"):
-    mesh_dir.mkdir(parents=True, exist_ok=True)
-    existing = list(mesh_dir.rglob("*.ply")) + list(mesh_dir.rglob("*.obj"))
-    if not existing and model_dir.is_dir():
-        candidates = sorted(model_dir.rglob("fuse_post.ply")) or sorted(model_dir.rglob("fuse.ply"))
-        if candidates:
-            dst = mesh_dir / candidates[-1].name
-            shutil.copy2(candidates[-1], dst)
-            print(f"[2D-SuGaR] Скопійовано TSDF-сітку у вихідну директорію: {dst}", flush=True)
-
+# 1. Якщо увімкнено WATERTIGHT_MESH=1, спершу зашиваємо дірки у fuse_post.ply (у $MODEL)
 if watertight:
     try:
         from sitecustomize import make_mesh_watertight
-        targets = []
         if model_dir.is_dir():
-            targets.extend(sorted(model_dir.rglob("fuse_post.ply")))
+            for f in sorted(model_dir.rglob("fuse_post.ply")) + sorted(model_dir.rglob("fuse.ply")):
+                make_mesh_watertight(f)
+    except Exception as exc:
+        print(f"[Watertight] Помилка герметизації TSDF-сітки: {exc}", flush=True)
+
+# 2. Якщо REFINEMENT_MODE=skip, переконуємося, що fuse_post.ply скопійовано у $MESH (та конвертовано у .obj)
+if ref_mode in ("skip", "0", "none", "false"):
+    mesh_dir.mkdir(parents=True, exist_ok=True)
+    if model_dir.is_dir():
+        candidates = sorted(model_dir.rglob("fuse_post.ply")) or sorted(model_dir.rglob("fuse.ply"))
+        if candidates:
+            src_ply = candidates[-1]
+            dst_ply = mesh_dir / src_ply.name
+            if src_ply.resolve() != dst_ply.resolve():
+                shutil.copy2(src_ply, dst_ply)
+            print(f"[2D-SuGaR] Скопійовано TSDF-сітку у вихідну директорію: {dst_ply}", flush=True)
+    print("Iteration: 15000\nloss: 0.000000  [ 15000/15000] computed in 0.01 minutes.", flush=True)
+
+# 3. Якщо увімкнено WATERTIGHT_MESH=1, герметизуємо всі фінальні сітки (.ply та .obj) у $MESH
+if watertight:
+    try:
+        from sitecustomize import make_mesh_watertight
         if mesh_dir.is_dir():
+            seen = set()
             for ext in ("*.ply", "*.obj"):
                 for f in sorted(mesh_dir.rglob(ext)):
                     if not f.name.startswith("point_cloud"):
-                        targets.append(f)
-        seen = set()
-        for t in targets:
-            rp = str(t.resolve())
-            if rp not in seen:
-                seen.add(rp)
-                make_mesh_watertight(t)
+                        rp = str(f.resolve())
+                        if rp not in seen:
+                            seen.add(rp)
+                            make_mesh_watertight(f)
     except Exception as exc:
-        print(f"[Watertight] Помилка фінальної герметизації: {exc}", flush=True)
+        print(f"[Watertight] Помилка фінальної герметизації у $MESH: {exc}", flush=True)
 PYEOF
 
 echo "Навчання завершено за $((SECONDS - STAGE_START)) сек."

@@ -207,6 +207,10 @@ class Job:
             if step1_artifact:
                 break
 
+        # If refinement was skipped (REFINEMENT_MODE=skip), fall back to step1_artifact (fuse_post.ply)
+        if step2_artifact is None and step1_artifact is not None:
+            step2_artifact = step1_artifact
+
         # Gaussian Splatting raw .ply (prefer point_cloud/iteration_*/point_cloud.ply or sugarfine*.ply)
         for rel in artifacts:
             low = rel.lower()
@@ -435,6 +439,15 @@ class JobManager:
             else:
                 start_stage = 2
                 skipped_stages = [1]
+
+        # Support composite scene_type ("object:skip:1") for backward-compatible parameter transport
+        if ":" in scene_type:
+            parts = scene_type.split(":")
+            scene_type = parts[0] or "object"
+            if len(parts) >= 2 and parts[1] and refinement_mode == "full":
+                refinement_mode = parts[1].strip().lower()
+            if len(parts) >= 3 and parts[2] and not watertight_mesh:
+                watertight_mesh = parts[2].strip().lower() in ("1", "true", "yes", "on")
 
         job = Job(
             id=job_id,
