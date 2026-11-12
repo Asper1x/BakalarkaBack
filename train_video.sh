@@ -52,6 +52,8 @@ INPUT_MODE="${INPUT_MODE:-video}"          # "video" або "dataset"
 SOURCE_DATASET="${SOURCE_DATASET:-}"        # шлях до існуючого датасету
 START_STAGE="${START_STAGE:-1}"             # 1..5
 SCENE_TYPE="${SCENE_TYPE:-object}"          # "object" (default) або "building"
+REFINEMENT_MODE="${REFINEMENT_MODE:-full}"  # "skip" (0 ітер., тільки TSDF), "fast" (2000), "balanced" (7000), "full" (15000)
+WATERTIGHT_MESH="${WATERTIGHT_MESH:-0}"     # "1" — автоматично зашивати всі дірки у сітках (100% watertight)
 
 usage() {
     echo "Використання:"
@@ -61,7 +63,7 @@ usage() {
     echo "  $0 ~/videos/stol.mp4 stol"
     echo
     echo "Необов'язкові змінні:"
-    echo "  FPS=6 MAX_FRAMES=220 ITERATIONS=20000 RESOLUTION=2 INPUT_MODE=dataset SOURCE_DATASET=/path/to/dataset"
+    echo "  FPS=6 MAX_FRAMES=220 ITERATIONS=20000 RESOLUTION=2 REFINEMENT_MODE=full|fast|balanced|skip WATERTIGHT_MESH=0|1 INPUT_MODE=dataset SOURCE_DATASET=/path/to/dataset"
     exit 1
 }
 
@@ -672,9 +674,16 @@ else
     echo "  lambda_dist = $LAMBDA_DIST"
 fi
 
+echo "  Режим Mesh Refinement (REFINEMENT_MODE): $REFINEMENT_MODE"
+echo "  Герметизація сітки (WATERTIGHT_MESH):    $WATERTIGHT_MESH"
+
 # Зберігаємо лише фінальну ітерацію (--save_iterations "$ITERATIONS"),
 # щоб не витрачати час на запис гігабайтних PLY-файлів на 1 та 7000 ітераціях.
 export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
+export REFINEMENT_MODE
+export WATERTIGHT_MESH
+export MODEL_OUTPUT_DIR="$MODEL"
+export MESH_OUTPUT_DIR="$MESH"
 
 # Експортуємо змінні середовища для streamer, щоб не змінювати CLI-аргументи стороннього train.py
 if [[ -n "$LIVE_STREAM_PACKET" ]]; then
@@ -700,6 +709,49 @@ python3 train.py \
     --sdf_trunc "$SDF_TRUNC" \
     --depth_trunc "$DEPTH_TRUNC" \
     -o "$MESH"
+
+# Гарантуємо наявність сітки у $MESH при REFINEMENT_MODE=skip та фінальну герметизацію при WATERTIGHT_MESH=1
+python3 - "$MODEL" "$MESH" "$REFINEMENT_MODE" "$WATERTIGHT_MESH" <<'PYEOF'
+import shutil
+import sys
+from pathlib import Path
+
+model_dir = Path(sys.argv[1])
+mesh_dir = Path(sys.argv[2])
+ref_mode = sys.argv[3].strip().lower()
+watertight = sys.argv[4].strip() == "1"
+
+# Якщо REFINEMENT_MODE=skip, переконуємося, що fuse_post.ply (або fuse.ply) скопійовано у $MESH
+if ref_mode in ("skip", "0", "none", "false"):
+    mesh_dir.mkdir(parents=True, exist_ok=True)
+    existing = list(mesh_dir.rglob("*.ply")) + list(mesh_dir.rglob("*.obj"))
+    if not existing and model_dir.is_dir():
+        candidates = sorted(model_dir.rglob("fuse_post.ply")) or sorted(model_dir.rglob("fuse.ply"))
+        if candidates:
+            dst = mesh_dir / candidates[-1].name
+            shutil.copy2(candidates[-1], dst)
+            print(f"[2D-SuGaR] Скопійовано TSDF-сітку у вихідну директорію: {dst}", flush=True)
+
+if watertight:
+    try:
+        from sitecustomize import make_mesh_watertight
+        targets = []
+        if model_dir.is_dir():
+            targets.extend(sorted(model_dir.rglob("fuse_post.ply")))
+        if mesh_dir.is_dir():
+            for ext in ("*.ply", "*.obj"):
+                for f in sorted(mesh_dir.rglob(ext)):
+                    if not f.name.startswith("point_cloud"):
+                        targets.append(f)
+        seen = set()
+        for t in targets:
+            rp = str(t.resolve())
+            if rp not in seen:
+                seen.add(rp)
+                make_mesh_watertight(t)
+    except Exception as exc:
+        print(f"[Watertight] Помилка фінальної герметизації: {exc}", flush=True)
+PYEOF
 
 echo "Навчання завершено за $((SECONDS - STAGE_START)) сек."
 

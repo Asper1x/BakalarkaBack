@@ -124,6 +124,8 @@ async def create_job(
     mask_foreground: bool = Form(config.DEFAULT_MASK_FOREGROUND, description="Optional foreground masking (rembg) in Stage 1"),
     stream_interval: int = Form(15, ge=1, le=1000, description="Iterations between live 3DGS stream packet frames"),
     scene_type: str = Form("object", description="Target scene type: 'object' (small asset) or 'building' (architectural facade)"),
+    refinement_mode: str = Form("full", description="SuGaR refinement mode: 'skip' (0 iters), 'fast' (2000), 'balanced' (7000), 'full' (15000)"),
+    watertight_mesh: bool = Form(False, description="Close all mesh holes to guarantee 100% watertight 2-manifold surface"),
 ):
     if input_mode not in ("video", "dataset"):
         raise HTTPException(status_code=400, detail="input_mode must be 'video' or 'dataset'.")
@@ -162,6 +164,8 @@ async def create_job(
             mask_foreground=mask_foreground,
             stream_interval=stream_interval,
             scene_type=scene_type,
+            refinement_mode=refinement_mode,
+            watertight_mesh=watertight_mesh,
         )
         return job.to_dict()
     except (ValueError, FileNotFoundError) as exc:

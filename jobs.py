@@ -56,6 +56,8 @@ class Job:
     mask_foreground: bool = config.DEFAULT_MASK_FOREGROUND
     stream_interval: int = 15
     scene_type: str = "object"
+    refinement_mode: str = "full"
+    watertight_mesh: bool = False
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -160,6 +162,8 @@ class Job:
         data["input_mode"] = self.input_mode
         data["dataset_name"] = self.dataset_name
         data["scene_type"] = self.scene_type
+        data["refinement_mode"] = self.refinement_mode
+        data["watertight_mesh"] = self.watertight_mesh
         data["start_stage"] = self.start_stage
         data["skipped_stages"] = self.skipped_stages
         data["stream_interval"] = self.stream_interval
@@ -352,6 +356,8 @@ class JobManager:
             f"SOURCE_DATASET={shlex.quote(job.source_dataset_path or '')} "
             f"START_STAGE={job.start_stage} "
             f"SCENE_TYPE={shlex.quote(job.scene_type)} "
+            f"REFINEMENT_MODE={shlex.quote(job.refinement_mode)} "
+            f"WATERTIGHT_MESH={'1' if job.watertight_mesh else '0'} "
             f"LIVE_STREAM_PACKET={shlex.quote(str(job.live_packet_path))} "
             f"STREAMING_FLAG={shlex.quote(str(job.streaming_flag_path))} "
             f"STREAM_INTERVAL={job.stream_interval} "
@@ -375,6 +381,8 @@ class JobManager:
         mask_foreground: bool = config.DEFAULT_MASK_FOREGROUND,
         stream_interval: int = 15,
         scene_type: str = "object",
+        refinement_mode: str = "full",
+        watertight_mesh: bool = False,
     ) -> Job:
         job_id = uuid.uuid4().hex[:12]
         if project_name:
@@ -445,6 +453,8 @@ class JobManager:
             mask_foreground=mask_foreground,
             stream_interval=stream_interval,
             scene_type=scene_type,
+            refinement_mode=refinement_mode,
+            watertight_mesh=watertight_mesh,
         )
 
         slurm_content = self._build_slurm_script(job)
@@ -2150,7 +2160,7 @@ class JobManager:
             if g_path.is_file():
                 gaussian_points = self._read_ply_vertex_count(g_path)
 
-        # Count mesh vertices and faces from Step 2 .obj
+        # Count mesh vertices and faces from Step 2 .obj (or Step 1 .ply if refinement was skipped)
         mesh_vertices = 0
         mesh_faces = 0
         if grouped["step2_artifact"]:
@@ -2162,6 +2172,10 @@ class JobManager:
                             mesh_vertices += 1
                         elif line.startswith("f "):
                             mesh_faces += 1
+        if mesh_vertices == 0 and grouped["step1_artifact"]:
+            s1_path = (output_root / grouped["step1_artifact"]).resolve()
+            if s1_path.is_file() and s1_path.suffix.lower() == ".ply":
+                mesh_vertices, mesh_faces = self._read_ply_vertex_and_face_count(s1_path)
 
         return {
             "psnr": psnr,
@@ -2174,6 +2188,24 @@ class JobManager:
             "mesh_faces": mesh_faces,
             "stage_durations_sec": stage_durations_sec,
         }
+
+    @staticmethod
+    def _read_ply_vertex_and_face_count(ply_path: Path) -> tuple[int, int]:
+        v_cnt = 0
+        f_cnt = 0
+        try:
+            with ply_path.open("rb") as f:
+                for _ in range(60):
+                    line = f.readline().decode("ascii", errors="ignore").strip()
+                    if line.startswith("element vertex "):
+                        v_cnt = int(line.split()[2])
+                    elif line.startswith("element face "):
+                        f_cnt = int(line.split()[2])
+                    elif line == "end_header":
+                        break
+        except Exception:
+            pass
+        return v_cnt, f_cnt
 
     @staticmethod
     def _read_ply_vertex_count(ply_path: Path) -> int:
