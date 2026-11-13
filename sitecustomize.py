@@ -181,7 +181,7 @@ def _get_visual_hull_context():
         return False
 
 
-def _filter_largest_connected_component(verts, faces, colors=None, min_component_ratio=0.18):
+def _filter_largest_connected_component(verts, faces, colors=None, min_component_ratio=0.03):
     """
     Keep the primary connected component of triangles (and any secondary component with >= min_component_ratio
     of the primary component's face count), removing detached background islands and floating debris.
@@ -246,12 +246,12 @@ def _filter_largest_connected_component(verts, faces, colors=None, min_component
 
 def _carve_mesh_with_visual_hull_and_clean(verts, faces, colors=None, label="mesh"):
     """
-    Remove background table skirts, stretched web triangles, and out-of-silhouette geometry:
-    1. Removes long stretched triangles (max_edge > 5.5 * median_edge) or high-degree spoke hubs.
-    2. Projects mesh vertices into all camera masks ($DATASET/masks/*.png) and removes any triangle
-       that falls outside the 3D Visual Hull (fg_ratio < 0.78), as well as dark outer-skirt triangles
-       (brightness < 0.08 and fg_ratio < 0.90).
-    3. Keeps only the main 3D connected component.
+    Remove stretched web triangles and out-of-silhouette background geometry using 3D Multi-View Visual Hull:
+    1. Removes long stretched triangles (max_edge > 8.0 * median_edge).
+    2. Projects mesh vertices into all camera masks ($DATASET/masks/*.png) and removes triangles
+       that fall strictly outside the 3D Visual Hull (without filtering by dark vertex brightness,
+       so black/dark objects are preserved intact).
+    3. Keeps connected components >= 3% of the main component.
     """
     import numpy as np
 
@@ -267,7 +267,7 @@ def _carve_mesh_with_visual_hull_and_clean(verts, faces, colors=None, label="mes
     orig_f_len = len(faces)
     keep_face = np.ones(len(faces), dtype=bool)
 
-    # A. Filter stretched/spike triangles (e.g. TSDF boundary rays or old spoke-wheel fans)
+    # A. Filter extreme stretched/spike triangles (e.g. TSDF boundary rays or old spoke-wheel fans)
     v0 = verts[faces[:, 0]]
     v1 = verts[faces[:, 1]]
     v2 = verts[faces[:, 2]]
@@ -277,8 +277,8 @@ def _carve_mesh_with_visual_hull_and_clean(verts, faces, colors=None, label="mes
     max_e = np.maximum(e0, np.maximum(e1, e2))
     med_e = float(np.median(max_e)) if len(max_e) > 0 else 0.01
     if med_e > 1e-7:
-        stretched = max_e > (med_e * 6.0)
-        if np.sum(~stretched) >= int(len(faces) * 0.30):
+        stretched = max_e > (med_e * 8.0)
+        if np.sum(~stretched) >= int(len(faces) * 0.45):
             keep_face &= ~stretched
 
     # B. Multi-View 3D Visual-Hull carving using $DATASET/masks/*.png
@@ -315,21 +315,10 @@ def _carve_mesh_with_visual_hull_and_clean(verts, faces, colors=None, label="mes
 
         fg_ratio = fg_cnt.astype(np.float32) / np.maximum(1, vis_cnt)
 
-        # Vertex brightness in [0, 1] if colors are available
-        v_bright = None
-        if has_colors:
-            c_float = colors.astype(np.float32)
-            if c_float.max() > 1.5:
-                c_float = c_float / 255.0
-            v_bright = np.max(c_float[:, :3], axis=1)
-
-        for thresh in (0.78, 0.68, 0.58):
+        for thresh in (0.60, 0.50, 0.40):
             v_ok = (vis_cnt < 3) | (fg_ratio >= thresh)
-            if v_bright is not None:
-                # Pitch-black vertices (table background bleed) require stricter silhouette agreement
-                v_ok &= ~((v_bright < 0.075) & (fg_ratio < min(0.90, thresh + 0.12)))
             cand_face = keep_face & v_ok[faces[:, 0]] & v_ok[faces[:, 1]] & v_ok[faces[:, 2]]
-            if np.sum(cand_face) >= max(200, int(len(faces) * 0.15)):
+            if np.sum(cand_face) >= max(200, int(len(faces) * 0.45)):
                 keep_face = cand_face
                 break
 
@@ -1121,11 +1110,9 @@ def _patch_point_generator(mod):
                 if ctx and len(xyz) > 100:
                     vis_cnt, fg_cnt = _project_points_to_visual_hull(xyz, ctx, min_views=3)
                     fg_ratio = fg_cnt.astype(np.float64) / np.maximum(vis_cnt, 1).astype(np.float64)
-                    rgb_max = rgb.max(axis=1) if rgb.ndim == 2 and rgb.shape[1] >= 3 else np.ones(len(xyz))
-                    bright_thresh = 5.0 if rgb_max.max() > 1.5 else 0.02
-                    keep = (vis_cnt >= 3) & (fg_ratio >= 0.72) & (rgb_max > bright_thresh)
+                    keep = (vis_cnt >= 3) & (fg_ratio >= 0.58)
                     if int(keep.sum()) < 500:
-                        keep = (vis_cnt >= 2) & (fg_ratio >= 0.55)
+                        keep = (vis_cnt >= 2) & (fg_ratio >= 0.45)
                     if int(keep.sum()) >= 100:
                         before_n = len(xyz)
                         xyz = xyz[keep]

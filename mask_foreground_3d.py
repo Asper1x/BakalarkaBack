@@ -206,7 +206,7 @@ def main() -> int:
     core_pts = pts_xyz_arr
     if len(pts_xyz_arr) > 20:
         dists_to_center = np.linalg.norm(pts_xyz_arr - look_at_center, axis=1)
-        core_mask = dists_to_center <= max(cam_radius * 0.55, np.percentile(dists_to_center, 65))
+        core_mask = dists_to_center <= max(cam_radius * 0.85, np.percentile(dists_to_center, 88))
         if np.sum(core_mask) >= 10:
             core_pts = pts_xyz_arr[core_mask]
 
@@ -245,10 +245,10 @@ def main() -> int:
                 in_b = (u >= 0) & (u < w) & (v >= 0) & (v < h)
                 if np.sum(in_b) >= 8:
                     u_in, v_in = u[in_b], v[in_b]
-                    x0 = int(max(0, np.percentile(u_in, 2) - w * 0.18))
-                    x1 = int(min(w, np.percentile(u_in, 98) + w * 0.18))
-                    y0 = int(max(0, np.percentile(v_in, 2) - h * 0.18))
-                    y1 = int(min(h, np.percentile(v_in, 98) + h * 0.18))
+                    x0 = int(max(0, np.percentile(u_in, 2) - w * 0.24))
+                    x1 = int(min(w, np.percentile(u_in, 98) + w * 0.24))
+                    y0 = int(max(0, np.percentile(v_in, 2) - h * 0.24))
+                    y1 = int(min(h, np.percentile(v_in, 98) + h * 0.24))
                     if (x1 - x0) >= w * 0.12 and (y1 - y0) >= h * 0.12:
                         roi_mask.fill(0)
                         roi_mask[y0:y1, x0:x1] = 1
@@ -322,36 +322,34 @@ def main() -> int:
             except Exception:
                 alpha_u8 = (roi_mask * 255).astype(np.uint8)
 
-        # Gate by 3D ROI if main object is inside ROI
-        masked_by_roi = np.where(roi_mask > 0, alpha_u8, 0).astype(np.uint8)
-        if np.sum(masked_by_roi > 127) >= (h * w * 0.01):
-            alpha_u8 = masked_by_roi
-
-        # Morphological closing + primary connected component selection
+        # Morphological closing + 3D-ROI component gating (keeps entire connected component that intersects ROI
+        # instead of slicing dark object regions that extend beyond sparse COLMAP keypoints)
         bin_mask = (alpha_u8 > 110).astype(np.uint8)
         kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, kernel_close)
 
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
-        if num_labels > 2:
-            best_label = 1
-            best_score = -1.0
-            img_center = np.array([w * 0.5, h * 0.5])
+        if num_labels > 1:
+            roi_hits = []
             for lbl in range(1, num_labels):
                 area = float(stats[lbl, cv2.CC_STAT_AREA])
                 if area < (h * w * 0.002):
                     continue
-                dist_c = np.linalg.norm(centroids[lbl] - img_center) / max(w, h)
-                score = area / (1.0 + 2.0 * dist_c)
-                if score > best_score:
-                    best_score = score
-                    best_label = lbl
-            keep_comp = (labels == best_label).astype(np.uint8)
-            max_area = float(stats[best_label, cv2.CC_STAT_AREA])
-            for lbl in range(1, num_labels):
-                if lbl != best_label and float(stats[lbl, cv2.CC_STAT_AREA]) >= 0.20 * max_area:
-                    keep_comp[labels == lbl] = 1
-            bin_mask = keep_comp
+                comp_mask = labels == lbl
+                overlap_ratio = float(np.sum(comp_mask & (roi_mask > 0))) / max(1.0, area)
+                dist_c = np.linalg.norm(centroids[lbl] - np.array([w * 0.5, h * 0.5])) / max(w, h)
+                score = (area * (0.2 + overlap_ratio)) / (1.0 + 2.0 * dist_c)
+                roi_hits.append((lbl, area, overlap_ratio, score))
+
+            if roi_hits:
+                roi_hits.sort(key=lambda item: item[3], reverse=True)
+                best_lbl, max_area, _, _ = roi_hits[0]
+                keep_comp = (labels == best_lbl).astype(np.uint8)
+                for lbl, area, overlap_ratio, _ in roi_hits[1:]:
+                    if overlap_ratio >= 0.15 and area >= 0.05 * max_area:
+                        keep_comp[labels == lbl] = 1
+                if np.sum(keep_comp) >= (h * w * 0.005):
+                    bin_mask = keep_comp
 
         # 3px boundary erosion + edge RGB decontamination (de-haloing) + strict zero background
         kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -383,7 +381,7 @@ def main() -> int:
         step = max(1, len(sampled_views) // 60)
         sampled_views = sampled_views[::step]
 
-    def compute_visual_hull_keep_mask(points_xyz, min_ratio=0.78):
+    def compute_visual_hull_keep_mask(points_xyz, min_ratio=0.60):
         if len(points_xyz) == 0 or not sampled_views:
             return np.ones(len(points_xyz), dtype=bool), np.ones(len(points_xyz), dtype=np.float32)
         vis_cnt = np.zeros(len(points_xyz), dtype=np.int32)
@@ -417,7 +415,7 @@ def main() -> int:
         score = ratio - 0.12 * (dists / max(0.1, cam_radius))
         keep = (vis_cnt >= 3) & (ratio >= min_ratio)
         if np.sum(keep) < min(250, len(points_xyz)):
-            for fallback_r in (0.70, 0.60, 0.50):
+            for fallback_r in (0.50, 0.42, 0.35):
                 keep = (vis_cnt >= 2) & (ratio >= fallback_r)
                 if np.sum(keep) >= min(250, len(points_xyz)):
                     break
@@ -429,7 +427,7 @@ def main() -> int:
         return keep, score
 
     if len(pts_xyz_arr) > 0 and pts3d_txt.is_file():
-        keep_pts, pts_score = compute_visual_hull_keep_mask(pts_xyz_arr, min_ratio=0.78)
+        keep_pts, pts_score = compute_visual_hull_keep_mask(pts_xyz_arr, min_ratio=0.60)
 
         # CRITICAL FOR 2D-SuGaR (dataset_readers.py & point_generator.py):
         # Every camera (IMAGE_ID) in images.txt MUST retain at least 20 3D points in points3D.txt,
@@ -466,7 +464,7 @@ def main() -> int:
                 if len(v_data) < 100:
                     continue
                 pts_ply = np.column_stack([v_data["x"], v_data["y"], v_data["z"]]).astype(np.float64)
-                keep_ply, _ = compute_visual_hull_keep_mask(pts_ply, min_ratio=0.78)
+                keep_ply, _ = compute_visual_hull_keep_mask(pts_ply, min_ratio=0.60)
                 if np.sum(keep_ply) < len(v_data):
                     filtered_v = v_data[keep_ply]
                     PlyData([PlyElement.describe(filtered_v, "vertex")], text=plydata.text).write(str(ply_file))
