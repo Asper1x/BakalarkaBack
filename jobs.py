@@ -65,14 +65,18 @@ class Job:
 
     @property
     def dataset_dir(self) -> Path:
+        # 1. Prefer job-specific working dataset ($DATASETS_ROOT/${NAME}-colmap-video) when populated
+        #    (e.g. video pipeline or cloned dataset workspace when MASK_FOREGROUND=1)
+        cand_video = config.DATASETS_ROOT / f"{self.name}-colmap-video"
+        if (cand_video / "sparse" / "0").is_dir() or (cand_video / "images").is_dir():
+            return cand_video
+
         if self.input_mode == "dataset" and self.source_dataset_path:
             p = Path(self.source_dataset_path)
             # If the source dataset already has sparse/0 or images, use it directly
             if (p / "sparse" / "0").is_dir() or (p / "images").is_dir() or (p / "input").is_dir():
                 return p
 
-        # 1. Check video dataset directory created by train_video.sh ($DATASETS_ROOT/${NAME}-colmap-video)
-        cand_video = config.DATASETS_ROOT / f"{self.name}-colmap-video"
         if cand_video.is_dir():
             return cand_video
 
