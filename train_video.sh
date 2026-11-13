@@ -750,6 +750,8 @@ esac
 export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
 export REFINEMENT_MODE
 export WATERTIGHT_MESH
+export MASK_FOREGROUND
+export DATASET_DIR="$DATASET"
 export MODEL_OUTPUT_DIR="$MODEL"
 export MESH_OUTPUT_DIR="$MESH"
 
@@ -779,8 +781,8 @@ python3 train.py \
     -o "$MESH" \
     "${REFINE_CLI_ARGS[@]}"
 
-# Гарантуємо герметизацію сітки при WATERTIGHT_MESH=1 та наявність сітки у $MESH при REFINEMENT_MODE=skip
-python3 - "$MODEL" "$MESH" "$REFINEMENT_MODE" "$WATERTIGHT_MESH" <<'PYEOF'
+# Гарантуємо очищення сітки за Visual Hull (при MASK_FOREGROUND=1), герметизацію (при WATERTIGHT_MESH=1) та наявність сітки у $MESH при REFINEMENT_MODE=skip
+python3 - "$MODEL" "$MESH" "$REFINEMENT_MODE" "$WATERTIGHT_MESH" "$MASK_FOREGROUND" <<'PYEOF'
 import shutil
 import sys
 from pathlib import Path
@@ -789,18 +791,19 @@ model_dir = Path(sys.argv[1])
 mesh_dir = Path(sys.argv[2])
 ref_mode = sys.argv[3].strip().lower()
 watertight = sys.argv[4].strip().lower() in ("1", "true", "yes", "on")
+mask_fg = sys.argv[5].strip().lower() in ("1", "true", "yes", "on")
 
-# 1. Якщо увімкнено WATERTIGHT_MESH=1, спершу зашиваємо дірки у fuse_post.ply (у $MODEL)
-if watertight:
+# 1. Очищуємо та (опціонально) герметизуємо fuse_post.ply / fuse.ply у $MODEL
+if watertight or mask_fg:
     try:
         from sitecustomize import make_mesh_watertight
         if model_dir.is_dir():
             for f in sorted(model_dir.rglob("fuse_post.ply")) + sorted(model_dir.rglob("fuse.ply")):
-                make_mesh_watertight(f)
+                make_mesh_watertight(f, force_watertight=watertight)
     except Exception as exc:
-        print(f"[Watertight] Помилка герметизації TSDF-сітки: {exc}", flush=True)
+        print(f"[Watertight] Помилка обробки TSDF-сітки: {exc}", flush=True)
 
-# 2. Якщо REFINEMENT_MODE=skip, переконуємося, що fuse_post.ply скопійовано у $MESH (та конвертовано у .obj)
+# 2. Якщо REFINEMENT_MODE=skip, переконуємося, що fuse_post.ply скопійовано у $MESH
 if ref_mode in ("skip", "0", "none", "false"):
     mesh_dir.mkdir(parents=True, exist_ok=True)
     if model_dir.is_dir():
@@ -813,8 +816,8 @@ if ref_mode in ("skip", "0", "none", "false"):
             print(f"[2D-SuGaR] Скопійовано TSDF-сітку у вихідну директорію: {dst_ply}", flush=True)
     print("Iteration: 15000\nloss: 0.000000  [ 15000/15000] computed in 0.01 minutes.", flush=True)
 
-# 3. Якщо увімкнено WATERTIGHT_MESH=1, герметизуємо всі фінальні сітки (.ply та .obj) у $MESH
-if watertight:
+# 3. Очищуємо та (опціонально) герметизуємо всі фінальні сітки (.ply та .obj) у $MESH
+if watertight or mask_fg:
     try:
         from sitecustomize import make_mesh_watertight
         if mesh_dir.is_dir():
@@ -825,9 +828,9 @@ if watertight:
                         rp = str(f.resolve())
                         if rp not in seen:
                             seen.add(rp)
-                            make_mesh_watertight(f)
+                            make_mesh_watertight(f, force_watertight=watertight)
     except Exception as exc:
-        print(f"[Watertight] Помилка фінальної герметизації у $MESH: {exc}", flush=True)
+        print(f"[Watertight] Помилка фінальної обробки у $MESH: {exc}", flush=True)
 PYEOF
 
 echo "Навчання завершено за $((SECONDS - STAGE_START)) сек."

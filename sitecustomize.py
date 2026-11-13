@@ -2,11 +2,14 @@
 Automatic hook for 3D Gaussian Splatting / 2D-SuGaR training:
 1. Non-blocking LiveStreamer telemetry & point-cloud streaming (when LIVE_STREAM_PACKET is set)
 2. Configurable SuGaR Mesh Refinement mode (REFINEMENT_MODE = skip | fast | balanced | full)
-3. Automatic Watertight Mesh hole-filling & manifold repair (when WATERTIGHT_MESH=1)
+3. 3D Visual-Hull & Black-Skirt Mesh Carving (when $DATASET/masks exists from MASK_FOREGROUND=1)
+4. Artifact-free Advancing-Front Watertight Mesh hole-filling (when WATERTIGHT_MESH=1)
 Loaded automatically via PYTHONPATH by Python site module.
 Compatible with Python 3.7+ (no PEP 604 union types).
 """
 import builtins
+from collections import Counter, defaultdict, deque
+import math
 import os
 from pathlib import Path
 import shutil
@@ -33,11 +36,12 @@ if live_packet:
 
 
 # ==============================================================================
-# 2. Resolve REFINEMENT_MODE and WATERTIGHT_MESH (including composite SCENE_TYPE)
+# 2. Resolve REFINEMENT_MODE, WATERTIGHT_MESH, MASK_FOREGROUND, and DATASET_DIR
 # ==============================================================================
 _raw_scene_type = os.getenv("SCENE_TYPE", "object").strip()
 _refinement_mode = os.getenv("REFINEMENT_MODE", "").strip().lower()
 _watertight_env = os.getenv("WATERTIGHT_MESH", "").strip().lower()
+_mask_fg_env = os.getenv("MASK_FOREGROUND", "").strip().lower()
 
 if ":" in _raw_scene_type:
     _parts = _raw_scene_type.split(":")
@@ -49,21 +53,313 @@ if ":" in _raw_scene_type:
 if not _refinement_mode:
     _refinement_mode = "full"
 _watertight_flag = _watertight_env in ("1", "true", "yes", "on")
+_mask_fg_flag = _mask_fg_env in ("1", "true", "yes", "on")
+
+
+def _resolve_dataset_dir():
+    env_ds = os.getenv("DATASET_DIR", "").strip()
+    if env_ds and os.path.isdir(env_ds):
+        return Path(env_ds)
+    # Also inspect sys.argv for -s / --source_path passed to train.py
+    argv = getattr(sys, "argv", []) or []
+    for i, arg in enumerate(argv):
+        if arg in ("-s", "--source_path") and i + 1 < len(argv):
+            cand = Path(argv[i + 1])
+            if cand.is_dir():
+                return cand
+    return None
+
+
+_VISUAL_HULL_CACHE = None
+
+
+def _get_visual_hull_context():
+    """
+    Lazily load COLMAP camera poses (sparse/0/{cameras,images}.txt) and 2D foreground masks (masks/*.png)
+    when MASK_FOREGROUND=1 (or when dataset/masks/ exists).
+    """
+    global _VISUAL_HULL_CACHE
+    if _VISUAL_HULL_CACHE is not None:
+        return _VISUAL_HULL_CACHE
+
+    ds_dir = _resolve_dataset_dir()
+    if ds_dir is None:
+        _VISUAL_HULL_CACHE = False
+        return False
+
+    masks_dir = ds_dir / "masks"
+    sparse_dir = ds_dir / "sparse" / "0"
+    if not masks_dir.is_dir() or not sparse_dir.is_dir():
+        _VISUAL_HULL_CACHE = False
+        return False
+
+    try:
+        import numpy as np
+        from PIL import Image
+
+        cameras = {}
+        cameras_txt = sparse_dir / "cameras.txt"
+        if cameras_txt.is_file():
+            for line in cameras_txt.read_text(encoding="utf-8", errors="ignore").splitlines():
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                parts = s.split()
+                if len(parts) >= 5:
+                    cam_id = int(parts[0])
+                    model = parts[1]
+                    w, h = int(parts[2]), int(parts[3])
+                    params = [float(x) for x in parts[4:]]
+                    if model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL") and len(params) >= 3:
+                        fx = fy = params[0]
+                        cx, cy = params[1], params[2]
+                    elif len(params) >= 4:
+                        fx, fy, cx, cy = params[0], params[1], params[2], params[3]
+                    else:
+                        fx = fy = float(max(w, h))
+                        cx, cy = w * 0.5, h * 0.5
+                    cameras[cam_id] = (w, h, fx, fy, cx, cy)
+
+        views = []
+        images_txt = sparse_dir / "images.txt"
+        if images_txt.is_file():
+            lines = [
+                l.strip()
+                for l in images_txt.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if l.strip() and not l.strip().startswith("#")
+            ]
+            for i in range(0, len(lines), 2):
+                elems = lines[i].split()
+                if len(elems) < 10:
+                    continue
+                qw, qx, qy, qz = map(float, elems[1:5])
+                tx, ty, tz = map(float, elems[5:8])
+                cam_id = int(elems[8])
+                img_name = " ".join(elems[9:])
+                if cam_id not in cameras:
+                    continue
+                R = np.array(
+                    [
+                        [1 - 2 * qy * qy - 2 * qz * qz, 2 * qx * qy - 2 * qz * qw, 2 * qx * qz + 2 * qy * qw],
+                        [2 * qx * qy + 2 * qz * qw, 1 - 2 * qx * qx - 2 * qz * qz, 2 * qy * qz - 2 * qx * qw],
+                        [2 * qx * qz - 2 * qy * qw, 2 * qy * qz + 2 * qx * qw, 1 - 2 * qx * qx - 2 * qy * qy],
+                    ],
+                    dtype=np.float64,
+                )
+                t = np.array([tx, ty, tz], dtype=np.float64)
+                views.append((img_name, R, t, cameras[cam_id]))
+
+        if not views:
+            _VISUAL_HULL_CACHE = False
+            return False
+
+        if len(views) > 56:
+            step = max(1, len(views) // 56)
+            views = views[::step]
+
+        mask_by_stem = {}
+        for mf in sorted(masks_dir.glob("*.png")):
+            try:
+                m_arr = np.asarray(Image.open(str(mf)).convert("L"), dtype=np.uint8)
+                mask_by_stem[mf.stem] = m_arr
+                mask_by_stem[mf.name] = m_arr
+            except Exception:
+                pass
+
+        if not mask_by_stem:
+            _VISUAL_HULL_CACHE = False
+            return False
+
+        _VISUAL_HULL_CACHE = (views, mask_by_stem)
+        return _VISUAL_HULL_CACHE
+    except Exception:
+        _VISUAL_HULL_CACHE = False
+        return False
+
+
+def _filter_largest_connected_component(verts, faces, colors=None, min_component_ratio=0.18):
+    """
+    Keep the primary connected component of triangles (and any secondary component with >= min_component_ratio
+    of the primary component's face count), removing detached background islands and floating debris.
+    """
+    import numpy as np
+
+    if len(faces) < 4:
+        return verts, faces, colors
+
+    # Build vertex -> face incidence via welded positions
+    quant = np.round(verts * 1e5).astype(np.int64)
+    _, _, weld_id = np.unique(quant, axis=0, return_index=True, return_inverse=True)
+    w_faces = weld_id[faces]
+
+    vert_to_faces = defaultdict(list)
+    for fi in range(len(w_faces)):
+        f0, f1, f2 = int(w_faces[fi, 0]), int(w_faces[fi, 1]), int(w_faces[fi, 2])
+        vert_to_faces[f0].append(fi)
+        vert_to_faces[f1].append(fi)
+        vert_to_faces[f2].append(fi)
+
+    visited = np.zeros(len(faces), dtype=bool)
+    components = []
+    for start_f in range(len(faces)):
+        if visited[start_f]:
+            continue
+        comp = []
+        q = deque([start_f])
+        visited[start_f] = True
+        while q:
+            cur_f = q.popleft()
+            comp.append(cur_f)
+            for wv in (int(w_faces[cur_f, 0]), int(w_faces[cur_f, 1]), int(w_faces[cur_f, 2])):
+                for nb_f in vert_to_faces[wv]:
+                    if not visited[nb_f]:
+                        visited[nb_f] = True
+                        q.append(nb_f)
+        components.append(comp)
+
+    if len(components) <= 1:
+        return verts, faces, colors
+
+    components.sort(key=len, reverse=True)
+    max_len = len(components[0])
+    keep_f_mask = np.zeros(len(faces), dtype=bool)
+    for comp in components:
+        if len(comp) >= max(16, int(max_len * min_component_ratio)):
+            keep_f_mask[comp] = True
+
+    if np.all(keep_f_mask):
+        return verts, faces, colors
+
+    kept_faces = faces[keep_f_mask]
+    used_v = np.unique(kept_faces)
+    remap = np.full(len(verts), -1, dtype=np.int64)
+    remap[used_v] = np.arange(len(used_v), dtype=np.int64)
+    new_verts = verts[used_v]
+    new_colors = colors[used_v] if (colors is not None and len(colors) == len(verts)) else colors
+    new_faces = remap[kept_faces]
+    return new_verts, new_faces, new_colors
+
+
+def _carve_mesh_with_visual_hull_and_clean(verts, faces, colors=None, label="mesh"):
+    """
+    Remove background table skirts, stretched web triangles, and out-of-silhouette geometry:
+    1. Removes long stretched triangles (max_edge > 5.5 * median_edge) or high-degree spoke hubs.
+    2. Projects mesh vertices into all camera masks ($DATASET/masks/*.png) and removes any triangle
+       that falls outside the 3D Visual Hull (fg_ratio < 0.78), as well as dark outer-skirt triangles
+       (brightness < 0.08 and fg_ratio < 0.90).
+    3. Keeps only the main 3D connected component.
+    """
+    import numpy as np
+
+    verts = np.asarray(verts, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    if len(verts) < 3 or len(faces) < 4:
+        return verts, faces, colors
+
+    has_colors = colors is not None and len(colors) == len(verts)
+    if has_colors:
+        colors = np.asarray(colors)
+
+    orig_f_len = len(faces)
+    keep_face = np.ones(len(faces), dtype=bool)
+
+    # A. Filter stretched/spike triangles (e.g. TSDF boundary rays or old spoke-wheel fans)
+    v0 = verts[faces[:, 0]]
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+    e0 = np.linalg.norm(v1 - v0, axis=1)
+    e1 = np.linalg.norm(v2 - v1, axis=1)
+    e2 = np.linalg.norm(v0 - v2, axis=1)
+    max_e = np.maximum(e0, np.maximum(e1, e2))
+    med_e = float(np.median(max_e)) if len(max_e) > 0 else 0.01
+    if med_e > 1e-7:
+        stretched = max_e > (med_e * 6.0)
+        if np.sum(~stretched) >= int(len(faces) * 0.30):
+            keep_face &= ~stretched
+
+    # B. Multi-View 3D Visual-Hull carving using $DATASET/masks/*.png
+    vh_ctx = _get_visual_hull_context()
+    if vh_ctx:
+        views, mask_by_stem = vh_ctx
+        vis_cnt = np.zeros(len(verts), dtype=np.int32)
+        fg_cnt = np.zeros(len(verts), dtype=np.int32)
+
+        for img_name, R, t, (cw, ch, fx, fy, cx, cy) in views:
+            m = mask_by_stem.get(img_name)
+            if m is None:
+                m = mask_by_stem.get(Path(img_name).stem)
+            if m is None:
+                continue
+            mh, mw = m.shape[:2]
+            sx, sy = float(mw) / max(1, cw), float(mh) / max(1, ch)
+            p_cam = verts @ R.T + t
+            z = p_cam[:, 2]
+            valid = z > 0.05
+            idx_v = np.nonzero(valid)[0]
+            if len(idx_v) == 0:
+                continue
+            z_v = z[idx_v]
+            u = np.round((fx * (p_cam[idx_v, 0] / z_v) + cx) * sx).astype(np.int32)
+            v = np.round((fy * (p_cam[idx_v, 1] / z_v) + cy) * sy).astype(np.int32)
+            in_b = (u >= 0) & (u < mw) & (v >= 0) & (v < mh)
+            idx_in = idx_v[in_b]
+            if len(idx_in) == 0:
+                continue
+            vis_cnt[idx_in] += 1
+            is_fg = m[v[in_b], u[in_b]] > 127
+            fg_cnt[idx_in[is_fg]] += 1
+
+        fg_ratio = fg_cnt.astype(np.float32) / np.maximum(1, vis_cnt)
+
+        # Vertex brightness in [0, 1] if colors are available
+        v_bright = None
+        if has_colors:
+            c_float = colors.astype(np.float32)
+            if c_float.max() > 1.5:
+                c_float = c_float / 255.0
+            v_bright = np.max(c_float[:, :3], axis=1)
+
+        for thresh in (0.78, 0.68, 0.58):
+            v_ok = (vis_cnt < 3) | (fg_ratio >= thresh)
+            if v_bright is not None:
+                # Pitch-black vertices (table background bleed) require stricter silhouette agreement
+                v_ok &= ~((v_bright < 0.075) & (fg_ratio < min(0.90, thresh + 0.12)))
+            cand_face = keep_face & v_ok[faces[:, 0]] & v_ok[faces[:, 1]] & v_ok[faces[:, 2]]
+            if np.sum(cand_face) >= max(200, int(len(faces) * 0.15)):
+                keep_face = cand_face
+                break
+
+    if not np.all(keep_face):
+        faces = faces[keep_face]
+        used_v = np.unique(faces)
+        remap = np.full(len(verts), -1, dtype=np.int64)
+        remap[used_v] = np.arange(len(used_v), dtype=np.int64)
+        verts = verts[used_v]
+        if has_colors:
+            colors = colors[used_v]
+        faces = remap[faces]
+
+    verts, faces, colors = _filter_largest_connected_component(verts, faces, colors)
+    if len(faces) < orig_f_len:
+        print(
+            "[MeshClean] Очищено сітку %s (Visual Hull + фільтр фону): залишено %d / %d граней."
+            % (label, len(faces), orig_f_len),
+            flush=True,
+        )
+    return verts, faces, colors
 
 
 # ==============================================================================
-# 3. Watertight Mesh Hole-Closing (Open3D + Pure NumPy Multi-Ring Smooth Cap)
+# 3. Advancing-Front Watertight Mesh Hole-Closing (Zero Spoke-Wheel Fans!)
 # ==============================================================================
 def _close_mesh_boundaries_numpy(verts, faces, colors=None):
     """
-    Topological boundary-loop detector and smooth concentric-ring membrane triangulator.
-    Detects open boundary edges via undirected edge triangle incidence == 1, traces all
-    closed boundary cycles, and seals both small holes and large base openings with a
-    smooth Laplacian-faired membrane cap while interpolating vertex colors.
-    Returns (repaired_verts, repaired_faces, repaired_colors, holes_closed_count).
+    Topological boundary-loop detector and 2-to-1 Advancing-Front Ring Reduction triangulator.
+    Halves the number of vertices on each concentric inward step (M -> M//2 -> M//4 -> ... -> <= 8),
+    avoiding high-degree starburst hub vertices and long radial spoke triangles.
+    Skips non-compact exterior tears so background edges are never bridged across empty space.
     """
     import numpy as np
-    from collections import Counter, defaultdict
 
     verts = np.asarray(verts, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
@@ -74,7 +370,7 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
     if has_colors:
         colors = np.asarray(colors)
 
-    # Step A: Weld duplicate vertices at identical 3D positions (e.g. TSDF sub-volume block seams)
+    # Step A: Weld duplicate vertices at identical 3D positions
     quant = np.round(verts * 1e5).astype(np.int64)
     _, unique_v_idx, inv_v_idx = np.unique(quant, axis=0, return_index=True, return_inverse=True)
     if len(unique_v_idx) < len(verts):
@@ -99,25 +395,25 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
     _, unique_f_idx = np.unique(np.sort(faces, axis=1), axis=0, return_index=True)
     faces = faces[np.sort(unique_f_idx)]
 
+    bbox_min = verts.min(axis=0)
+    bbox_max = verts.max(axis=0)
+    bbox_diag = float(np.linalg.norm(bbox_max - bbox_min)) or 1.0
+
     verts_list = [verts]
     colors_list = [colors] if has_colors else None
     total_loops_closed = 0
 
-    for _pass in range(3):
-        # Extract all 3 directed half-edges per triangle
+    for _pass in range(2):
         h0 = faces[:, [0, 1]]
         h1 = faces[:, [1, 2]]
         h2 = faces[:, [2, 0]]
         all_he = np.vstack([h0, h1, h2])
 
-        # Count undirected edge occurrences across all triangles.
-        # An edge {min(u,v), max(u,v)} is on an open hole boundary iff it belongs to strictly 1 triangle.
         u_min = np.minimum(all_he[:, 0], all_he[:, 1])
         u_max = np.maximum(all_he[:, 0], all_he[:, 1])
         undir_edges = np.column_stack([u_min, u_max])
         undir_counts = Counter(map(tuple, undir_edges.tolist()))
 
-        # Build undirected boundary adjacency graph + preferred reversed half-edge orientation
         undir_adj = defaultdict(list)
         pref_dir = set()
         boundary_edges = set()
@@ -129,7 +425,6 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
                 boundary_edges.add(key)
                 undir_adj[u_i].append(v_i)
                 undir_adj[v_i].append(u_i)
-                # Existing triangle has u_i -> v_i, so hole cap needs v_i -> u_i
                 pref_dir.add((v_i, u_i))
 
         if not boundary_edges:
@@ -147,86 +442,117 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
             L = len(loop_nodes)
             if L < 3:
                 return
+
+            idx_arr = np.array(loop_nodes, dtype=np.int64)
+            loop_pts = cur_verts[idx_arr]
+            centroid = loop_pts.mean(axis=0, keepdims=True)
+
+            # Check hole compactness: skip giant jagged exterior tears that would bridge across space
+            if L > 16:
+                radii = np.linalg.norm(loop_pts - centroid, axis=1)
+                r_max = float(np.max(radii))
+                r_med = float(np.median(radii))
+                seg_lens = np.linalg.norm(np.roll(loop_pts, -1, axis=0) - loop_pts, axis=1)
+                perim = float(np.sum(seg_lens))
+                tortuosity = perim / max(1e-6, 2.0 * math.pi * r_med)
+                if r_max > 0.52 * bbox_diag or tortuosity > 3.6:
+                    return
+
             # Orient loop consistently with pref_dir
             fwd_score = sum(1 for i in range(L) if (loop_nodes[i], loop_nodes[(i + 1) % L]) in pref_dir)
             rev_score = sum(1 for i in range(L) if (loop_nodes[(i + 1) % L], loop_nodes[i]) in pref_dir)
             if rev_score > fwd_score:
                 loop_nodes = list(reversed(loop_nodes))
+                idx_arr = np.array(loop_nodes, dtype=np.int64)
+                loop_pts = cur_verts[idx_arr]
 
             if L == 3:
                 new_faces.append(np.array([[loop_nodes[0], loop_nodes[1], loop_nodes[2]]], dtype=np.int64))
                 loops_in_pass += 1
                 return
 
-            idx_arr = np.array(loop_nodes, dtype=np.int64)
-            loop_pts = cur_verts[idx_arr]
-            centroid = loop_pts.mean(axis=0, keepdims=True)
-            loop_cols = cur_colors[idx_arr] if (colors_list is not None and cur_colors is not None) else None
-            c_mean = loop_cols.mean(axis=0, keepdims=True) if loop_cols is not None else None
+            curr_ids = list(loop_nodes)
+            curr_pts = loop_pts.copy()
+            curr_cols = (
+                cur_colors[idx_arr].astype(np.float64)
+                if (colors_list is not None and cur_colors is not None)
+                else None
+            )
 
-            if L <= 12:
-                verts_list.append(centroid)
-                if colors_list is not None and c_mean is not None:
-                    if np.issubdtype(cur_colors.dtype, np.integer):
-                        c_mean = np.clip(np.round(c_mean), 0, 255).astype(cur_colors.dtype)
-                    colors_list.append(c_mean)
-                center_vid = next_vid
-                next_vid += 1
-                fan = np.array(
-                    [[loop_nodes[i], loop_nodes[(i + 1) % L], center_vid] for i in range(L)],
-                    dtype=np.int64,
+            # 2-to-1 Advancing-Front Ring Reduction until ring has <= 8 vertices
+            while len(curr_ids) > 8:
+                M = len(curr_ids)
+                Mp = M // 2
+
+                # Smooth contour and step 35% inward toward current ring centroid
+                smoothed_pts = (
+                    0.25 * np.roll(curr_pts, 1, axis=0)
+                    + 0.50 * curr_pts
+                    + 0.25 * np.roll(curr_pts, -1, axis=0)
                 )
-                new_faces.append(fan)
-                loops_in_pass += 1
-                return
+                ring_center = smoothed_pts.mean(axis=0, keepdims=True)
+                contracted_pts = 0.65 * smoothed_pts + 0.35 * ring_center
 
-            # Multi-ring smooth membrane cap for larger holes (L > 12, e.g. object base)
-            ring_fracs = (0.28, 0.56, 0.80)
-            prev_ring_ids = loop_nodes
-            curr_ring_pts = loop_pts.copy()
-            curr_ring_cols = loop_cols.copy() if loop_cols is not None else None
+                # Downsample 2-to-1 by pairing (2j, 2j+1)
+                even_pts = contracted_pts[0 : 2 * Mp : 2]
+                odd_pts = contracted_pts[1 : 2 * Mp : 2]
+                inner_pts = 0.5 * (even_pts + odd_pts)
+                verts_list.append(inner_pts)
 
-            for frac in ring_fracs:
-                # Smooth along loop contour before contracting toward centroid
-                for _ in range(3):
-                    curr_ring_pts = 0.25 * np.roll(curr_ring_pts, 1, axis=0) + 0.5 * curr_ring_pts + 0.25 * np.roll(curr_ring_pts, -1, axis=0)
-                    if curr_ring_cols is not None:
-                        curr_ring_cols = 0.25 * np.roll(curr_ring_cols, 1, axis=0) + 0.5 * curr_ring_cols + 0.25 * np.roll(curr_ring_cols, -1, axis=0)
-
-                ring_pts = (1.0 - frac) * curr_ring_pts + frac * centroid
-                verts_list.append(ring_pts)
-                if colors_list is not None and curr_ring_cols is not None and c_mean is not None:
-                    ring_cols = (1.0 - frac) * curr_ring_cols + frac * c_mean
+                if colors_list is not None and curr_cols is not None:
+                    smoothed_cols = (
+                        0.25 * np.roll(curr_cols, 1, axis=0)
+                        + 0.50 * curr_cols
+                        + 0.25 * np.roll(curr_cols, -1, axis=0)
+                    )
+                    col_center = smoothed_cols.mean(axis=0, keepdims=True)
+                    contracted_cols = 0.65 * smoothed_cols + 0.35 * col_center
+                    inner_cols = 0.5 * (contracted_cols[0 : 2 * Mp : 2] + contracted_cols[1 : 2 * Mp : 2])
+                    out_cols = inner_cols
                     if np.issubdtype(cur_colors.dtype, np.integer):
-                        ring_cols = np.clip(np.round(ring_cols), 0, 255).astype(cur_colors.dtype)
-                    colors_list.append(ring_cols)
+                        out_cols = np.clip(np.round(inner_cols), 0, 255).astype(cur_colors.dtype)
+                    else:
+                        out_cols = inner_cols.astype(cur_colors.dtype)
+                    colors_list.append(out_cols)
+                    curr_cols = inner_cols
 
-                ring_ids = [next_vid + i for i in range(L)]
-                next_vid += L
+                inner_ids = [next_vid + j for j in range(Mp)]
+                next_vid += Mp
 
-                # Connect prev_ring_ids to ring_ids with 2L triangles
                 strip_tris = []
-                for i in range(L):
-                    ni = (i + 1) % L
-                    a0, a1 = prev_ring_ids[i], prev_ring_ids[ni]
-                    b0, b1 = ring_ids[i], ring_ids[ni]
-                    strip_tris.append([a0, a1, b1])
-                    strip_tris.append([a0, b1, b0])
-                new_faces.append(np.array(strip_tris, dtype=np.int64))
-                prev_ring_ids = ring_ids
+                for j in range(Mp):
+                    nj = (j + 1) % Mp
+                    a0 = curr_ids[2 * j]
+                    a1 = curr_ids[2 * j + 1]
+                    a2 = curr_ids[2 * j + 2] if (2 * j + 2) < M else curr_ids[0]
+                    b0 = inner_ids[j]
+                    b1 = inner_ids[nj]
+                    strip_tris.append([a0, a1, b0])
+                    strip_tris.append([a1, a2, b1])
+                    strip_tris.append([b0, a1, b1])
+                if M % 2 == 1:
+                    strip_tris.append([curr_ids[M - 1], curr_ids[0], inner_ids[0]])
 
-            # Connect innermost ring to center vertex
-            verts_list.append(centroid)
-            if colors_list is not None and c_mean is not None:
-                c_out = c_mean
+                new_faces.append(np.array(strip_tris, dtype=np.int64))
+                curr_ids = inner_ids
+                curr_pts = inner_pts
+
+            # Close final small ring (<= 8 vertices)
+            M_final = len(curr_ids)
+            final_center = curr_pts.mean(axis=0, keepdims=True)
+            verts_list.append(final_center)
+            if colors_list is not None and curr_cols is not None:
+                c_final = curr_cols.mean(axis=0, keepdims=True)
                 if np.issubdtype(cur_colors.dtype, np.integer):
-                    c_out = np.clip(np.round(c_out), 0, 255).astype(cur_colors.dtype)
-                colors_list.append(c_out)
+                    c_final = np.clip(np.round(c_final), 0, 255).astype(cur_colors.dtype)
+                else:
+                    c_final = c_final.astype(cur_colors.dtype)
+                colors_list.append(c_final)
+
             center_vid = next_vid
             next_vid += 1
-
             fan = np.array(
-                [[prev_ring_ids[i], prev_ring_ids[(i + 1) % L], center_vid] for i in range(L)],
+                [[curr_ids[i], curr_ids[(i + 1) % M_final], center_vid] for i in range(M_final)],
                 dtype=np.int64,
             )
             new_faces.append(fan)
@@ -254,7 +580,6 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
                 if not candidates:
                     break
 
-                # Prefer edge oriented (curr -> nb) in pref_dir, or one closing a cycle
                 chosen_nb, chosen_ek = candidates[0]
                 for nb, ek in candidates:
                     if (curr, nb) in pref_dir:
@@ -288,8 +613,9 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
 
 def _make_obj_watertight(path):
     """
-    Close all open boundary loops in a Wavefront .obj file while preserving
-    existing UV coordinates (vt), normals (vn), mtllib, and usemtl directives.
+    Carve out-of-silhouette background triangles (when masks exist) and close compact open
+    boundary loops in a Wavefront .obj file using 2-to-1 Advancing-Front Ring Reduction
+    while preserving UV coordinates (vt), normals (vn), mtllib, and usemtl directives.
     """
     import numpy as np
 
@@ -328,12 +654,9 @@ def _make_obj_watertight(path):
         return False
 
     orig_v_count = len(verts)
-    orig_f_count = len(faces_v)
     verts_arr = np.asarray(verts, dtype=np.float64)
     faces_arr = np.asarray(faces_v, dtype=np.int64)
-
-    # For OBJ we run without reordering existing vertex indices so original UV/normal indices stay valid
-    from collections import Counter, defaultdict
+    bbox_diag = float(np.linalg.norm(verts_arr.max(axis=0) - verts_arr.min(axis=0))) or 1.0
 
     h0 = faces_arr[:, [0, 1]]
     h1 = faces_arr[:, [1, 2]]
@@ -358,7 +681,6 @@ def _make_obj_watertight(path):
             pref_dir.add((v_i, u_i))
 
     if not boundary_edges:
-        print("[Watertight] OBJ-сітка " + str(path.name) + " вже герметична.", flush=True)
         return True
 
     has_vt = len(vts) > 0 and len(face_v_to_vt) > 0
@@ -370,6 +692,123 @@ def _make_obj_watertight(path):
     append_f_lines = []
     loops_closed = 0
     used_edges = set()
+
+    def _seal_obj_loop(loop):
+        nonlocal next_v_idx, next_vt_idx, loops_closed
+        L = len(loop)
+        if L < 3:
+            return
+        loop_pts = verts_arr[np.array(loop, dtype=np.int64)]
+        centroid = loop_pts.mean(axis=0, keepdims=True)
+        if L > 16:
+            radii = np.linalg.norm(loop_pts - centroid, axis=1)
+            r_max = float(np.max(radii))
+            r_med = float(np.median(radii))
+            perim = float(np.sum(np.linalg.norm(np.roll(loop_pts, -1, axis=0) - loop_pts, axis=1)))
+            if r_max > 0.52 * bbox_diag or (perim / max(1e-6, 2.0 * math.pi * r_med)) > 3.6:
+                return
+
+        fwd_score = sum(1 for i in range(L) if (loop[i], loop[(i + 1) % L]) in pref_dir)
+        rev_score = sum(1 for i in range(L) if (loop[(i + 1) % L], loop[i]) in pref_dir)
+        if rev_score > fwd_score:
+            loop = list(reversed(loop))
+            loop_pts = verts_arr[np.array(loop, dtype=np.int64)]
+
+        curr_v_1based = [vi + 1 for vi in loop]
+        curr_vt_1based = [face_v_to_vt.get(vi, 0) + 1 for vi in loop] if has_vt else None
+        curr_pts = loop_pts.copy()
+        curr_uvs = (
+            np.array(
+                [
+                    vts_arr[face_v_to_vt[vi]]
+                    if (vi in face_v_to_vt and face_v_to_vt[vi] < len(vts_arr))
+                    else [0.5, 0.5]
+                    for vi in loop
+                ],
+                dtype=np.float64,
+            )
+            if (has_vt and vts_arr is not None)
+            else None
+        )
+
+        while len(curr_v_1based) > 8:
+            M = len(curr_v_1based)
+            Mp = M // 2
+            smoothed = 0.25 * np.roll(curr_pts, 1, axis=0) + 0.50 * curr_pts + 0.25 * np.roll(curr_pts, -1, axis=0)
+            rc = smoothed.mean(axis=0, keepdims=True)
+            contracted = 0.65 * smoothed + 0.35 * rc
+            inner_pts = 0.5 * (contracted[0 : 2 * Mp : 2] + contracted[1 : 2 * Mp : 2])
+
+            inner_v_1based = []
+            inner_vt_1based = []
+            for j in range(Mp):
+                append_v_lines.append("v %.6f %.6f %.6f" % (inner_pts[j, 0], inner_pts[j, 1], inner_pts[j, 2]))
+                inner_v_1based.append(next_v_idx)
+                next_v_idx += 1
+
+            if curr_uvs is not None:
+                sm_uv = 0.25 * np.roll(curr_uvs, 1, axis=0) + 0.50 * curr_uvs + 0.25 * np.roll(curr_uvs, -1, axis=0)
+                uc = sm_uv.mean(axis=0, keepdims=True)
+                con_uv = 0.65 * sm_uv + 0.35 * uc
+                in_uv = 0.5 * (con_uv[0 : 2 * Mp : 2] + con_uv[1 : 2 * Mp : 2])
+                for j in range(Mp):
+                    append_vt_lines.append("vt %.6f %.6f" % (in_uv[j, 0], in_uv[j, 1]))
+                    inner_vt_1based.append(next_vt_idx)
+                    next_vt_idx += 1
+                curr_uvs = in_uv
+
+            for j in range(Mp):
+                nj = (j + 1) % Mp
+                i0, i1 = 2 * j, 2 * j + 1
+                i2 = (2 * j + 2) if (2 * j + 2) < M else 0
+                a0, a1, a2 = curr_v_1based[i0], curr_v_1based[i1], curr_v_1based[i2]
+                b0, b1 = inner_v_1based[j], inner_v_1based[nj]
+                if curr_vt_1based is not None and inner_vt_1based:
+                    ta0, ta1, ta2 = curr_vt_1based[i0], curr_vt_1based[i1], curr_vt_1based[i2]
+                    tb0, tb1 = inner_vt_1based[j], inner_vt_1based[nj]
+                    append_f_lines.append("f %d/%d %d/%d %d/%d" % (a0, ta0, a1, ta1, b0, tb0))
+                    append_f_lines.append("f %d/%d %d/%d %d/%d" % (a1, ta1, a2, ta2, b1, tb1))
+                    append_f_lines.append("f %d/%d %d/%d %d/%d" % (b0, tb0, a1, ta1, b1, tb1))
+                else:
+                    append_f_lines.append("f %d %d %d" % (a0, a1, b0))
+                    append_f_lines.append("f %d %d %d" % (a1, a2, b1))
+                    append_f_lines.append("f %d %d %d" % (b0, a1, b1))
+
+            if M % 2 == 1:
+                a_last, a_first, b_first = curr_v_1based[M - 1], curr_v_1based[0], inner_v_1based[0]
+                if curr_vt_1based is not None and inner_vt_1based:
+                    append_f_lines.append(
+                        "f %d/%d %d/%d %d/%d"
+                        % (a_last, curr_vt_1based[M - 1], a_first, curr_vt_1based[0], b_first, inner_vt_1based[0])
+                    )
+                else:
+                    append_f_lines.append("f %d %d %d" % (a_last, a_first, b_first))
+
+            curr_v_1based = inner_v_1based
+            curr_vt_1based = inner_vt_1based if inner_vt_1based else None
+            curr_pts = inner_pts
+
+        M_fin = len(curr_v_1based)
+        c_xyz = curr_pts.mean(axis=0)
+        append_v_lines.append("v %.6f %.6f %.6f" % (c_xyz[0], c_xyz[1], c_xyz[2]))
+        c_v_idx = next_v_idx
+        next_v_idx += 1
+        c_vt_idx = 1
+        if curr_uvs is not None:
+            uv_c = curr_uvs.mean(axis=0)
+            append_vt_lines.append("vt %.6f %.6f" % (uv_c[0], uv_c[1]))
+            c_vt_idx = next_vt_idx
+            next_vt_idx += 1
+
+        for i in range(M_fin):
+            ni = (i + 1) % M_fin
+            a, b = curr_v_1based[i], curr_v_1based[ni]
+            if curr_vt_1based is not None:
+                ta, tb = curr_vt_1based[i], curr_vt_1based[ni]
+                append_f_lines.append("f %d/%d %d/%d %d/%d" % (a, ta, b, tb, c_v_idx, c_vt_idx))
+            else:
+                append_f_lines.append("f %d %d %d" % (a, b, c_v_idx))
+        loops_closed += 1
 
     for e_start in list(boundary_edges):
         if e_start in used_edges:
@@ -399,43 +838,8 @@ def _make_obj_watertight(path):
             if chosen_nb in visited_idx:
                 loop_start = visited_idx[chosen_nb]
                 loop = path_nodes[loop_start:]
-                L = len(loop)
-                if L >= 3:
-                    fwd_score = sum(1 for i in range(L) if (loop[i], loop[(i + 1) % L]) in pref_dir)
-                    rev_score = sum(1 for i in range(L) if (loop[(i + 1) % L], loop[i]) in pref_dir)
-                    if rev_score > fwd_score:
-                        loop = list(reversed(loop))
-                    if L == 3:
-                        v1, v2, v3 = loop[0] + 1, loop[1] + 1, loop[2] + 1
-                        if has_vt:
-                            t1 = face_v_to_vt.get(loop[0], 0) + 1
-                            t2 = face_v_to_vt.get(loop[1], 0) + 1
-                            t3 = face_v_to_vt.get(loop[2], 0) + 1
-                            append_f_lines.append("f %d/%d %d/%d %d/%d" % (v1, t1, v2, t2, v3, t3))
-                        else:
-                            append_f_lines.append("f %d %d %d" % (v1, v2, v3))
-                    else:
-                        c_xyz = verts_arr[np.array(loop, dtype=np.int64)].mean(axis=0)
-                        append_v_lines.append("v %.6f %.6f %.6f" % (c_xyz[0], c_xyz[1], c_xyz[2]))
-                        c_v_idx = next_v_idx
-                        next_v_idx += 1
-                        c_vt_idx = 1
-                        if has_vt and vts_arr is not None:
-                            nb_uvs = [vts_arr[face_v_to_vt[n]] for n in loop if n in face_v_to_vt and face_v_to_vt[n] < len(vts_arr)]
-                            uv = np.mean(nb_uvs, axis=0) if nb_uvs else np.array([0.5, 0.5])
-                            append_vt_lines.append("vt %.6f %.6f" % (uv[0], uv[1]))
-                            c_vt_idx = next_vt_idx
-                            next_vt_idx += 1
-                        for i in range(L):
-                            a = loop[i]
-                            b = loop[(i + 1) % L]
-                            if has_vt:
-                                ta = face_v_to_vt.get(a, 0) + 1
-                                tb = face_v_to_vt.get(b, 0) + 1
-                                append_f_lines.append("f %d/%d %d/%d %d/%d" % (a + 1, ta, b + 1, tb, c_v_idx, c_vt_idx))
-                            else:
-                                append_f_lines.append("f %d %d %d" % (a + 1, b + 1, c_v_idx))
-                    loops_closed += 1
+                if len(loop) >= 3:
+                    _seal_obj_loop(loop)
                 for removed in path_nodes[loop_start + 1 :]:
                     visited_idx.pop(removed, None)
                 path_nodes = path_nodes[: loop_start + 1]
@@ -458,12 +862,17 @@ def _make_obj_watertight(path):
     return True
 
 
-def _repair_open3d_mesh_in_place(mesh, label="mesh"):
+def _repair_open3d_mesh_in_place(mesh, label="mesh", do_watertight=None):
     """
-    Clean non-manifold edges and close all open boundary loops on an Open3D TriangleMesh object in memory.
+    1. Carve out-of-silhouette background triangles (when $DATASET/masks exists).
+    2. Keep primary connected component.
+    3. Optionally close compact open boundary loops (when do_watertight / _watertight_flag is True).
     """
     import numpy as np
     import open3d as o3d
+
+    if do_watertight is None:
+        do_watertight = _watertight_flag
 
     faces = np.asarray(mesh.triangles, dtype=np.int64)
     if len(faces) == 0:
@@ -480,48 +889,52 @@ def _repair_open3d_mesh_in_place(mesh, label="mesh"):
     has_colors = mesh.has_vertex_colors() and len(mesh.vertex_colors) == len(verts)
     colors = np.asarray(mesh.vertex_colors, dtype=np.float64) if has_colors else None
 
-    repaired_verts, repaired_faces, repaired_colors, loops_closed = _close_mesh_boundaries_numpy(
-        verts, faces, colors
-    )
+    verts, faces, colors = _carve_mesh_with_visual_hull_and_clean(verts, faces, colors, label=label)
+
+    loops_closed = 0
+    if do_watertight:
+        verts, faces, colors, loops_closed = _close_mesh_boundaries_numpy(verts, faces, colors)
 
     out_mesh = o3d.geometry.TriangleMesh()
-    out_mesh.vertices = o3d.utility.Vector3dVector(repaired_verts)
-    out_mesh.triangles = o3d.utility.Vector3iVector(repaired_faces.astype(np.int32))
-    if repaired_colors is not None and len(repaired_colors) == len(repaired_verts):
-        out_mesh.vertex_colors = o3d.utility.Vector3dVector(repaired_colors)
+    out_mesh.vertices = o3d.utility.Vector3dVector(verts)
+    out_mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    if colors is not None and len(colors) == len(verts):
+        out_mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
     out_mesh.remove_duplicated_triangles()
     out_mesh.remove_degenerate_triangles()
     out_mesh.remove_unreferenced_vertices()
     out_mesh.compute_vertex_normals()
 
-    print(
-        "[Watertight] Готово (%s): зашито %d відкритих контурів -> %d V, %d F."
-        % (label, loops_closed, len(out_mesh.vertices), len(out_mesh.triangles)),
-        flush=True,
-    )
+    if do_watertight:
+        print(
+            "[Watertight] Готово (%s): зашито %d відкритих контурів -> %d V, %d F."
+            % (label, loops_closed, len(out_mesh.vertices), len(out_mesh.triangles)),
+            flush=True,
+        )
     return out_mesh, loops_closed
 
 
 _IN_WATERTIGHT_WRITE = False
 
 
-def make_mesh_watertight(mesh_file):
+def make_mesh_watertight(mesh_file, force_watertight=None):
     """
-    Close all open boundary loops (holes) in a triangle mesh (.ply or .obj)
-    while preserving vertex colors (for .ply) or UV textures (for .obj).
-    Uses Open3D + NumPy (installed natively in 2d-sugar environment) with a
-    plyfile fallback, requiring zero external dependencies.
+    Clean background skirt triangles (via 3D Visual Hull) and close compact open boundary loops
+    in a triangle mesh (.ply or .obj) while preserving vertex colors or UV textures.
     """
     global _IN_WATERTIGHT_WRITE
     if _IN_WATERTIGHT_WRITE:
         return False
 
+    do_wt = _watertight_flag if force_watertight is None else bool(force_watertight)
     path = Path(str(mesh_file))
     if not path.is_file():
         return False
 
     suffix = path.suffix.lower()
     if suffix == ".obj":
+        if not do_wt:
+            return False
         try:
             return _make_obj_watertight(path)
         except Exception as exc:
@@ -535,7 +948,6 @@ def make_mesh_watertight(mesh_file):
     try:
         import numpy as np
 
-        # Strategy 1: Open3D (standard in 2d-sugar environment)
         try:
             import open3d as o3d
 
@@ -543,13 +955,12 @@ def make_mesh_watertight(mesh_file):
             if len(mesh.triangles) == 0:
                 return False
 
-            out_mesh, _ = _repair_open3d_mesh_in_place(mesh, label=path.name)
+            out_mesh, _ = _repair_open3d_mesh_in_place(mesh, label=path.name, do_watertight=do_wt)
             o3d.io.write_triangle_mesh(str(path), out_mesh)
             return True
         except ImportError:
             pass
 
-        # Strategy 2: plyfile fallback
         from plyfile import PlyData, PlyElement
 
         plydata = PlyData.read(str(path))
@@ -572,37 +983,33 @@ def make_mesh_watertight(mesh_file):
         if len(faces) == 0:
             return False
 
-        repaired_verts, repaired_faces, repaired_colors, loops_closed = _close_mesh_boundaries_numpy(
-            verts, faces, colors
-        )
+        verts, faces, colors = _carve_mesh_with_visual_hull_and_clean(verts, faces, colors, label=path.name)
+        loops_closed = 0
+        if do_wt:
+            verts, faces, colors, loops_closed = _close_mesh_boundaries_numpy(verts, faces, colors)
 
-        if has_rgb and repaired_colors is not None:
+        if has_rgb and colors is not None:
             v_dtype = [("x", "f4"), ("y", "f4"), ("z", "f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")]
-            v_arr = np.empty(len(repaired_verts), dtype=v_dtype)
-            v_arr["x"] = repaired_verts[:, 0].astype(np.float32)
-            v_arr["y"] = repaired_verts[:, 1].astype(np.float32)
-            v_arr["z"] = repaired_verts[:, 2].astype(np.float32)
-            v_arr["red"] = repaired_colors[:, 0].astype(np.uint8)
-            v_arr["green"] = repaired_colors[:, 1].astype(np.uint8)
-            v_arr["blue"] = repaired_colors[:, 2].astype(np.uint8)
+            v_arr = np.empty(len(verts), dtype=v_dtype)
+            v_arr["x"] = verts[:, 0].astype(np.float32)
+            v_arr["y"] = verts[:, 1].astype(np.float32)
+            v_arr["z"] = verts[:, 2].astype(np.float32)
+            v_arr["red"] = colors[:, 0].astype(np.uint8)
+            v_arr["green"] = colors[:, 1].astype(np.uint8)
+            v_arr["blue"] = colors[:, 2].astype(np.uint8)
         else:
             v_dtype = [("x", "f4"), ("y", "f4"), ("z", "f4")]
-            v_arr = np.empty(len(repaired_verts), dtype=v_dtype)
-            v_arr["x"] = repaired_verts[:, 0].astype(np.float32)
-            v_arr["y"] = repaired_verts[:, 1].astype(np.float32)
-            v_arr["z"] = repaired_verts[:, 2].astype(np.float32)
+            v_arr = np.empty(len(verts), dtype=v_dtype)
+            v_arr["x"] = verts[:, 0].astype(np.float32)
+            v_arr["y"] = verts[:, 1].astype(np.float32)
+            v_arr["z"] = verts[:, 2].astype(np.float32)
 
         f_dtype = [(f_prop, "i4", (3,))]
-        f_arr = np.empty(len(repaired_faces), dtype=f_dtype)
-        f_arr[f_prop] = repaired_faces.astype(np.int32)
+        f_arr = np.empty(len(faces), dtype=f_dtype)
+        f_arr[f_prop] = faces.astype(np.int32)
 
         PlyData([PlyElement.describe(v_arr, "vertex"), PlyElement.describe(f_arr, "face")], text=False).write(
             str(path)
-        )
-        print(
-            "[Watertight] Готово (%s, plyfile): зашито %d дірок -> %d V, %d F."
-            % (path.name, loops_closed, len(repaired_verts), len(repaired_faces)),
-            flush=True,
         )
         return True
     except Exception as exc:
@@ -616,7 +1023,7 @@ def make_mesh_watertight(mesh_file):
 # 4. Module Import Hooks (GaussianModel LiveStreamer + Open3D + SuGaR Refine)
 # ==============================================================================
 def _patch_open3d_io(o3d_mod):
-    if not _watertight_flag:
+    if not (_watertight_flag or _mask_fg_flag or _get_visual_hull_context()):
         return
     io_mod = getattr(o3d_mod, "io", None)
     if io_mod is None or getattr(io_mod, "_bakalarka_wt_patched", False):
@@ -631,7 +1038,9 @@ def _patch_open3d_io(o3d_mod):
         fname_str = str(filename)
         if not _IN_WATERTIGHT_WRITE and fname_str.lower().endswith(".ply"):
             try:
-                mesh, _ = _repair_open3d_mesh_in_place(mesh, label=os.path.basename(fname_str))
+                mesh, _ = _repair_open3d_mesh_in_place(
+                    mesh, label=os.path.basename(fname_str), do_watertight=_watertight_flag
+                )
             except Exception:
                 pass
         return orig_write(filename, mesh, *w_args, **w_kwargs)
@@ -662,8 +1071,8 @@ def _patch_refine_module(refine_mod):
                 if candidates:
                     mesh_path = str(candidates[-1])
 
-        if _watertight_flag and mesh_path and os.path.isfile(str(mesh_path)):
-            make_mesh_watertight(mesh_path)
+        if (_watertight_flag or _mask_fg_flag or _get_visual_hull_context()) and mesh_path and os.path.isfile(str(mesh_path)):
+            make_mesh_watertight(mesh_path, force_watertight=_watertight_flag)
 
         if _refinement_mode in ("skip", "0", "none", "false"):
             print(
@@ -694,11 +1103,11 @@ def _patch_refine_module(refine_mod):
 
         res = orig_refined_training(*r_args, **r_kwargs)
 
-        if _watertight_flag and output_dir and os.path.isdir(str(output_dir)):
+        if (_watertight_flag or _mask_fg_flag or _get_visual_hull_context()) and output_dir and os.path.isdir(str(output_dir)):
             for ext in ("*.ply", "*.obj"):
                 for f in sorted(Path(output_dir).rglob(ext)):
                     if not f.name.startswith("point_cloud"):
-                        make_mesh_watertight(f)
+                        make_mesh_watertight(f, force_watertight=_watertight_flag)
 
         return res
 
@@ -746,8 +1155,8 @@ try:
             except Exception:
                 pass
 
-        # Hook 2: open3d.io.write_triangle_mesh for immediate in-memory watertight repair
-        if _watertight_flag and (name == "open3d" or name.startswith("open3d.")):
+        # Hook 2: open3d.io.write_triangle_mesh for immediate in-memory Visual-Hull carving & watertight repair
+        if name == "open3d" or name.startswith("open3d."):
             try:
                 o3d_root = sys.modules.get("open3d") or mod
                 if o3d_root is not None:

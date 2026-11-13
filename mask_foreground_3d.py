@@ -345,22 +345,18 @@ def main() -> int:
                     keep_comp[labels == lbl] = 1
             bin_mask = keep_comp
 
-        # 2px boundary erosion + edge RGB decontamination (de-haloing)
+        # 3px boundary erosion + edge RGB decontamination (de-haloing) + strict zero background
         kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         inner_mask = cv2.erode(bin_mask, kernel_erode, iterations=1)
         if np.sum(inner_mask) < 100:
             inner_mask = bin_mask
 
-        eroded_rgb = cv2.erode(rgb, kernel_erode, iterations=1)
-        border_zone = (bin_mask > 0) & (inner_mask == 0)
+        eroded_rgb = cv2.erode(rgb, kernel_erode, iterations=2)
+        border_zone = (inner_mask > 0) & (cv2.erode(inner_mask, kernel_erode, iterations=1) == 0)
         clean_rgb = rgb.copy()
         clean_rgb[border_zone] = eroded_rgb[border_zone]
 
-        soft_alpha = cv2.GaussianBlur(inner_mask.astype(np.float32), (3, 3), 0)
-        soft_alpha = np.where(inner_mask > 0, np.maximum(soft_alpha, 0.85), soft_alpha * 0.5)
-        soft_alpha = np.clip(soft_alpha, 0.0, 1.0)
-
-        out_rgb = (clean_rgb.astype(np.float32) * soft_alpha[:, :, None]).astype(np.uint8)
+        out_rgb = np.where(inner_mask[:, :, None] > 0, clean_rgb, 0).astype(np.uint8)
         Image.fromarray(out_rgb).save(str(img_path), quality=96)
 
         final_mask_u8 = (inner_mask * 255).astype(np.uint8)
@@ -372,12 +368,14 @@ def main() -> int:
             print("[MaskFG] Оброблено %d / %d кадрів..." % (idx_img + 1, len(img_files)), flush=True)
 
     # 3. 3D Visual-Hull pruning of COLMAP points3D.txt and all prior .ply point clouds
+    #    Use strict multi-view consistency (ratio >= 0.80) because table points near the object base
+    #    project through the object silhouette from opposite-side cameras (~40-60% of views).
     sampled_views = views
-    if len(sampled_views) > 48:
-        step = max(1, len(sampled_views) // 48)
+    if len(sampled_views) > 60:
+        step = max(1, len(sampled_views) // 60)
         sampled_views = sampled_views[::step]
 
-    def compute_visual_hull_keep_mask(points_xyz):
+    def compute_visual_hull_keep_mask(points_xyz, min_ratio=0.80):
         if len(points_xyz) == 0 or not sampled_views:
             return np.ones(len(points_xyz), dtype=bool)
         vis_cnt = np.zeros(len(points_xyz), dtype=np.int32)
@@ -407,22 +405,27 @@ def main() -> int:
             is_fg = m[v[in_b], u[in_b]] > 127
             fg_cnt[idx_in[is_fg]] += 1
         ratio = fg_cnt.astype(np.float32) / np.maximum(1, vis_cnt)
-        keep = (vis_cnt >= 2) & (ratio >= 0.50)
-        if np.sum(keep) < min(300, len(points_xyz)):
+        keep = (vis_cnt >= 3) & (ratio >= min_ratio)
+        if np.sum(keep) < min(250, len(points_xyz)):
+            for fallback_r in (0.70, 0.60, 0.50):
+                keep = (vis_cnt >= 2) & (ratio >= fallback_r)
+                if np.sum(keep) >= min(250, len(points_xyz)):
+                    break
+        if np.sum(keep) < min(200, len(points_xyz)):
             dists = np.linalg.norm(points_xyz - look_at_center, axis=1)
             score = ratio - 0.15 * (dists / max(0.1, cam_radius))
-            top_k = min(len(points_xyz), max(500, int(len(points_xyz) * 0.25)))
+            top_k = min(len(points_xyz), max(400, int(len(points_xyz) * 0.20)))
             best_idx = np.argsort(score)[-top_k:]
             keep = np.zeros(len(points_xyz), dtype=bool)
             keep[best_idx] = True
         return keep
 
     if len(pts_xyz_arr) > 0 and pts3d_txt.is_file():
-        keep_pts = compute_visual_hull_keep_mask(pts_xyz_arr)
+        keep_pts = compute_visual_hull_keep_mask(pts_xyz_arr, min_ratio=0.80)
         kept_lines = [pts_lines[i] for i in range(len(pts_lines)) if keep_pts[i]]
         pts3d_txt.write_text("\n".join(pts_header + kept_lines) + "\n", encoding="utf-8")
         print(
-            "[MaskFG] Очищено points3D.txt (Visual Hull): залишено %d / %d точок об'єкта."
+            "[MaskFG] Очищено points3D.txt (Visual Hull, min_ratio=0.80): залишено %d / %d точок об'єкта."
             % (len(kept_lines), len(pts_lines)),
             flush=True,
         )
@@ -439,7 +442,7 @@ def main() -> int:
                 if len(v_data) < 100:
                     continue
                 pts_ply = np.column_stack([v_data["x"], v_data["y"], v_data["z"]]).astype(np.float64)
-                keep_ply = compute_visual_hull_keep_mask(pts_ply)
+                keep_ply = compute_visual_hull_keep_mask(pts_ply, min_ratio=0.80)
                 if np.sum(keep_ply) < len(v_data):
                     filtered_v = v_data[keep_ply]
                     PlyData([PlyElement.describe(filtered_v, "vertex")], text=plydata.text).write(str(ply_file))
@@ -453,33 +456,48 @@ def main() -> int:
     except ImportError:
         pass
 
-    # 4. Mask .npy depth maps so 2D-SuGaR depth regularization ignores the background
-    for depth_sub in ("depths", "depth_priors", "estimated_dense_depth", "depth"):
-        d_dir = dataset_dir / depth_sub
-        if d_dir.is_dir():
-            masked_d_cnt = 0
-            for npy_f in sorted(d_dir.glob("*.npy")):
-                m = mask_by_name.get(npy_f.stem)
-                if m is None:
-                    continue
-                try:
-                    arr = np.load(str(npy_f))
-                    orig_shape = arr.shape
-                    sq = np.squeeze(arr)
-                    if sq.ndim == 2:
-                        mh, mw = sq.shape[:2]
-                        m_resized = (
-                            cv2.resize(m, (mw, mh), interpolation=cv2.INTER_NEAREST)
-                            if m.shape[:2] != (mh, mw)
-                            else m
-                        )
-                        sq = np.where(m_resized > 127, sq, 0.0).astype(arr.dtype)
-                        np.save(str(npy_f), sq.reshape(orig_shape))
-                        masked_d_cnt += 1
-                except Exception:
-                    pass
-            if masked_d_cnt > 0:
-                print("[MaskFG] Замасковано %d карт глибини у %s/" % (masked_d_cnt, depth_sub), flush=True)
+    # 4. Mask ALL .npy depth and normal prior maps across dataset subdirectories so 2D-SuGaR regularization
+    #    does not spawn black Gaussians on the table/background
+    masked_npy_total = 0
+    for npy_f in sorted(dataset_dir.rglob("*.npy")):
+        m = mask_by_name.get(npy_f.stem)
+        if m is None:
+            continue
+        try:
+            arr = np.load(str(npy_f))
+            orig_shape = arr.shape
+            sq = np.squeeze(arr)
+            if sq.ndim == 2:
+                mh, mw = sq.shape[:2]
+                m_resized = (
+                    cv2.resize(m, (mw, mh), interpolation=cv2.INTER_NEAREST) if m.shape[:2] != (mh, mw) else m
+                )
+                sq = np.where(m_resized > 127, sq, 0.0).astype(arr.dtype)
+                np.save(str(npy_f), sq.reshape(orig_shape))
+                masked_npy_total += 1
+            elif sq.ndim == 3:
+                if sq.shape[0] in (1, 3, 4) and sq.shape[2] not in (1, 3, 4):
+                    # (C, H, W)
+                    mh, mw = sq.shape[1], sq.shape[2]
+                    m_resized = (
+                        cv2.resize(m, (mw, mh), interpolation=cv2.INTER_NEAREST) if m.shape[:2] != (mh, mw) else m
+                    )
+                    sq = np.where(m_resized[None, :, :] > 127, sq, 0.0).astype(arr.dtype)
+                    np.save(str(npy_f), sq.reshape(orig_shape))
+                    masked_npy_total += 1
+                elif sq.shape[2] in (1, 3, 4):
+                    # (H, W, C)
+                    mh, mw = sq.shape[0], sq.shape[1]
+                    m_resized = (
+                        cv2.resize(m, (mw, mh), interpolation=cv2.INTER_NEAREST) if m.shape[:2] != (mh, mw) else m
+                    )
+                    sq = np.where(m_resized[:, :, None] > 127, sq, 0.0).astype(arr.dtype)
+                    np.save(str(npy_f), sq.reshape(orig_shape))
+                    masked_npy_total += 1
+        except Exception:
+            pass
+    if masked_npy_total > 0:
+        print("[MaskFG] Замасковано %d .npy карт глибини та нормалей." % masked_npy_total, flush=True)
 
     return 0
 
