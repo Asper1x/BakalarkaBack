@@ -480,10 +480,8 @@ def main() -> int:
     except ImportError:
         pass
 
-    # 4. Ensure 2D .npy depth maps have strictly positive finite values (never 0.0!),
-    #    because dataset_readers.py:256 computes `scale = camera_coord[2] / prior_depth` without zero-checks;
-    #    0.0 in prior_depth causes divide-by-zero -> inf -> NaN -> KeyError in point_generator.py!
-    #    (Filtering of generated 3D points is handled directly in sitecustomize.py's gaussian_generator hook.)
+    # 4. Ensure 2D .npy depth maps have strictly positive finite values (never 0.0!)
+    #    and 3D .npy normal maps have unit-safe non-zero vectors (never [0,0,0] -> 0/0 = NaN!).
     sanitized_npy_total = 0
     for npy_f in sorted(dataset_dir.rglob("*.npy")):
         try:
@@ -497,10 +495,28 @@ def main() -> int:
                     sq = np.where(valid_pos, sq, max(0.1, med_d)).astype(arr.dtype)
                     np.save(str(npy_f), sq.reshape(orig_shape))
                     sanitized_npy_total += 1
+            elif sq.ndim == 3 and sq.shape[2] == 3:
+                nrm = np.linalg.norm(sq, axis=2, keepdims=True)
+                bad_n = (~np.all(np.isfinite(sq), axis=2)) | (nrm[:, :, 0] < 1e-6)
+                if np.any(bad_n):
+                    sq_clean = sq.copy()
+                    sq_clean[bad_n] = np.array([0.0, 0.0, 1.0], dtype=arr.dtype)
+                    np.save(str(npy_f), sq_clean.reshape(orig_shape))
+                    sanitized_npy_total += 1
+            elif sq.ndim == 3 and sq.shape[0] == 3:
+                nrm = np.linalg.norm(sq, axis=0, keepdims=True)
+                bad_n = (~np.all(np.isfinite(sq), axis=0)) | (nrm[0] < 1e-6)
+                if np.any(bad_n):
+                    sq_clean = sq.copy()
+                    sq_clean[0, bad_n] = 0.0
+                    sq_clean[1, bad_n] = 0.0
+                    sq_clean[2, bad_n] = 1.0
+                    np.save(str(npy_f), sq_clean.reshape(orig_shape))
+                    sanitized_npy_total += 1
         except Exception:
             pass
     if sanitized_npy_total > 0:
-        print("[MaskFG] Відновлено позитивні значення у %d .npy картах глибини." % sanitized_npy_total, flush=True)
+        print("[MaskFG] Відновлено валідні значення у %d .npy картах глибини/нормалей." % sanitized_npy_total, flush=True)
 
     return 0
 

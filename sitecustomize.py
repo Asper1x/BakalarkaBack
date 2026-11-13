@@ -76,11 +76,15 @@ _VISUAL_HULL_CACHE = None
 def _get_visual_hull_context():
     """
     Lazily load COLMAP camera poses (sparse/0/{cameras,images}.txt) and 2D foreground masks (masks/*.png)
-    when MASK_FOREGROUND=1 (or when dataset/masks/ exists).
+    when MASK_FOREGROUND=1.
     """
     global _VISUAL_HULL_CACHE
     if _VISUAL_HULL_CACHE is not None:
         return _VISUAL_HULL_CACHE
+
+    if not _mask_fg_flag:
+        _VISUAL_HULL_CACHE = False
+        return False
 
     ds_dir = _resolve_dataset_dir()
     if ds_dir is None:
@@ -177,44 +181,6 @@ def _get_visual_hull_context():
         return False
 
 
-def _project_points_to_visual_hull(points_xyz, ctx, min_views=3):
-    import numpy as np
-
-    views, mask_by_stem = ctx
-    n_pts = len(points_xyz)
-    vis_cnt = np.zeros(n_pts, dtype=np.int32)
-    fg_cnt = np.zeros(n_pts, dtype=np.int32)
-    if n_pts == 0 or not views:
-        return vis_cnt, fg_cnt
-
-    for img_name, R, t, (cw, ch, fx, fy, cx, cy) in views:
-        m = mask_by_stem.get(img_name)
-        if m is None:
-            m = mask_by_stem.get(Path(img_name).stem)
-        if m is None:
-            continue
-        mh, mw = m.shape[:2]
-        sx, sy = float(mw) / max(1, cw), float(mh) / max(1, ch)
-        p_cam = points_xyz @ R.T + t
-        z = p_cam[:, 2]
-        valid = z > 0.05
-        idx_v = np.nonzero(valid)[0]
-        if len(idx_v) == 0:
-            continue
-        z_v = z[idx_v]
-        u = np.round((fx * (p_cam[idx_v, 0] / z_v) + cx) * sx).astype(np.int32)
-        v = np.round((fy * (p_cam[idx_v, 1] / z_v) + cy) * sy).astype(np.int32)
-        in_b = (u >= 0) & (u < mw) & (v >= 0) & (v < mh)
-        idx_in = idx_v[in_b]
-        if len(idx_in) == 0:
-            continue
-        vis_cnt[idx_in] += 1
-        is_fg = m[v[in_b], u[in_b]] > 127
-        fg_cnt[idx_in[is_fg]] += 1
-
-    return vis_cnt, fg_cnt
-
-
 def _filter_largest_connected_component(verts, faces, colors=None, min_component_ratio=0.18):
     """
     Keep the primary connected component of triangles (and any secondary component with >= min_component_ratio
@@ -260,10 +226,9 @@ def _filter_largest_connected_component(verts, faces, colors=None, min_component
 
     components.sort(key=len, reverse=True)
     max_len = len(components[0])
-    min_keep = min(max_len, max(16, int(max_len * min_component_ratio)))
     keep_f_mask = np.zeros(len(faces), dtype=bool)
     for comp in components:
-        if len(comp) >= min_keep:
+        if len(comp) >= max(16, int(max_len * min_component_ratio)):
             keep_f_mask[comp] = True
 
     if np.all(keep_f_mask):
@@ -929,14 +894,10 @@ def _repair_open3d_mesh_in_place(mesh, label="mesh", do_watertight=None):
     colors = np.asarray(mesh.vertex_colors, dtype=np.float64) if has_colors else None
 
     verts, faces, colors = _carve_mesh_with_visual_hull_and_clean(verts, faces, colors, label=label)
-    if len(faces) == 0 or len(verts) < 3:
-        return mesh, 0
 
     loops_closed = 0
     if do_watertight:
         verts, faces, colors, loops_closed = _close_mesh_boundaries_numpy(verts, faces, colors)
-        if len(faces) == 0 or len(verts) < 3:
-            return mesh, 0
 
     out_mesh = o3d.geometry.TriangleMesh()
     out_mesh.vertices = o3d.utility.Vector3dVector(verts)
@@ -1065,105 +1026,150 @@ def make_mesh_watertight(mesh_file, force_watertight=None):
 # ==============================================================================
 # 4. Module Import Hooks (GaussianModel LiveStreamer + Open3D + SuGaR Refine)
 # ==============================================================================
+def _sanitize_camera_infos_in_place(cam_infos):
+    import numpy as np
+
+    if not cam_infos:
+        return
+    is_list = isinstance(cam_infos, list)
+    for idx in range(len(cam_infos)):
+        ci = cam_infos[idx]
+        replacements = {}
+
+        d_arr = getattr(ci, "depth", None)
+        if isinstance(d_arr, np.ndarray):
+            bad_d = ~np.isfinite(d_arr) | (d_arr <= 1e-4)
+            if np.any(bad_d):
+                good_d = d_arr[~bad_d]
+                fill_d = float(np.median(good_d)) if good_d.size > 0 else 1.0
+                replacements["depth"] = np.where(bad_d, fill_d, d_arr).astype(np.float32)
+
+        n_arr = getattr(ci, "normal", None)
+        if isinstance(n_arr, np.ndarray) and n_arr.ndim == 3 and n_arr.shape[-1] == 3:
+            n_norm = np.linalg.norm(n_arr, axis=-1, keepdims=True)
+            bad_n = (~np.all(np.isfinite(n_arr), axis=-1)) | (n_norm[..., 0] < 1e-6)
+            if np.any(bad_n):
+                n_clean = n_arr.copy().astype(np.float32)
+                n_clean[bad_n] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                replacements["normal"] = n_clean
+
+        if replacements:
+            if is_list and hasattr(ci, "_replace"):
+                try:
+                    cam_infos[idx] = ci._replace(**replacements)
+                    continue
+                except Exception:
+                    pass
+            for k, v in replacements.items():
+                try:
+                    setattr(ci, k, v)
+                except Exception:
+                    pass
+
+
 def _patch_point_generator(mod):
     if mod is None or getattr(mod, "_bakalarka_pg_patched", False):
         return
     orig_gen = getattr(mod, "gaussian_generator", None)
-    if not callable(orig_gen):
-        return
+    if callable(orig_gen) and not getattr(orig_gen, "_bakalarka_wrapped", False):
+        def patched_gaussian_generator(cam_infos, cam_intrinsics, num_generated_points, image_depth_scale_map, *g_args, **g_kwargs):
+            import numpy as np
+
+            _sanitize_camera_infos_in_place(cam_infos)
+
+            if isinstance(image_depth_scale_map, dict):
+                valid_scales = []
+                for v in image_depth_scale_map.values():
+                    if isinstance(v, dict):
+                        sc = v.get("estimated_scale")
+                        if sc is not None and np.isfinite(sc) and float(sc) > 1e-4:
+                            valid_scales.append(float(sc))
+                fallback_scale = float(np.median(valid_scales)) if valid_scales else 1.0
+
+                for ci in cam_infos:
+                    img_id = getattr(ci, "image_id", None)
+                    if img_id is not None:
+                        entry = image_depth_scale_map.get(img_id)
+                        if not isinstance(entry, dict):
+                            image_depth_scale_map[img_id] = {"estimated_scale": fallback_scale, "offset": 0.0}
+                        else:
+                            sc = entry.get("estimated_scale")
+                            if sc is None or not np.isfinite(sc) or float(sc) <= 1e-4:
+                                entry["estimated_scale"] = fallback_scale
+                            off = entry.get("offset", 0.0)
+                            if off is None or not np.isfinite(off):
+                                entry["offset"] = 0.0
+
+            xyz, rgb, normals = orig_gen(cam_infos, cam_intrinsics, num_generated_points, image_depth_scale_map, *g_args, **g_kwargs)
+
+            try:
+                xyz = np.asarray(xyz, dtype=np.float64)
+                rgb = np.asarray(rgb, dtype=np.float64)
+                normals = np.asarray(normals, dtype=np.float64)
+
+                finite_mask = (
+                    np.all(np.isfinite(xyz), axis=1)
+                    & np.all(np.isfinite(rgb), axis=1)
+                    & np.all(np.isfinite(normals), axis=1)
+                )
+                if not np.all(finite_mask):
+                    xyz = xyz[finite_mask]
+                    rgb = rgb[finite_mask]
+                    normals = normals[finite_mask]
+
+                ctx = _get_visual_hull_context()
+                if ctx and len(xyz) > 100:
+                    vis_cnt, fg_cnt = _project_points_to_visual_hull(xyz, ctx, min_views=3)
+                    fg_ratio = fg_cnt.astype(np.float64) / np.maximum(vis_cnt, 1).astype(np.float64)
+                    rgb_max = rgb.max(axis=1) if rgb.ndim == 2 and rgb.shape[1] >= 3 else np.ones(len(xyz))
+                    bright_thresh = 5.0 if rgb_max.max() > 1.5 else 0.02
+                    keep = (vis_cnt >= 3) & (fg_ratio >= 0.72) & (rgb_max > bright_thresh)
+                    if int(keep.sum()) < 500:
+                        keep = (vis_cnt >= 2) & (fg_ratio >= 0.55)
+                    if int(keep.sum()) >= 100:
+                        before_n = len(xyz)
+                        xyz = xyz[keep]
+                        rgb = rgb[keep]
+                        normals = normals[keep]
+                        print(
+                            "[VisualHull] Очищено згенеровані точки ініціалізації: %d -> %d (відсіяно %d фонових точок)."
+                            % (before_n, len(xyz), before_n - len(xyz)),
+                            flush=True,
+                        )
+
+                norms_len = np.linalg.norm(normals, axis=1, keepdims=True)
+                bad_n = (norms_len[:, 0] < 1e-8) | (~np.isfinite(norms_len[:, 0]))
+                if np.any(bad_n):
+                    normals[bad_n] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                    norms_len = np.linalg.norm(normals, axis=1, keepdims=True)
+                normals = normals / np.maximum(norms_len, 1e-8)
+            except Exception as exc:
+                print("[VisualHull] Попередження у patched_gaussian_generator: %s" % exc, flush=True)
+
+            return xyz, rgb, normals
+
+        patched_gaussian_generator._bakalarka_wrapped = True
+        mod.gaussian_generator = patched_gaussian_generator
+
+    orig_read_colmap = getattr(mod, "readColmapSceneInfo", None)
+    if callable(orig_read_colmap) and not getattr(orig_read_colmap, "_bakalarka_wrapped", False):
+        def patched_read_colmap(*r_args, **r_kwargs):
+            scene_info = orig_read_colmap(*r_args, **r_kwargs)
+            try:
+                train_cams = getattr(scene_info, "train_cameras", None)
+                test_cams = getattr(scene_info, "test_cameras", None)
+                if isinstance(train_cams, list):
+                    _sanitize_camera_infos_in_place(train_cams)
+                if isinstance(test_cams, list):
+                    _sanitize_camera_infos_in_place(test_cams)
+            except Exception:
+                pass
+            return scene_info
+
+        patched_read_colmap._bakalarka_wrapped = True
+        mod.readColmapSceneInfo = patched_read_colmap
 
     mod._bakalarka_pg_patched = True
-
-    def patched_gaussian_generator(cam_infos, cam_intrinsics, num_generated_points, image_depth_scale_map, *g_args, **g_kwargs):
-        import numpy as np
-
-        if isinstance(image_depth_scale_map, dict):
-            valid_scales = []
-            for v in image_depth_scale_map.values():
-                if isinstance(v, dict):
-                    sc = v.get("estimated_scale")
-                    if sc is not None and np.isfinite(sc) and float(sc) > 1e-4:
-                        valid_scales.append(float(sc))
-            fallback_scale = float(np.median(valid_scales)) if valid_scales else 1.0
-
-            for ci in cam_infos:
-                img_id = getattr(ci, "image_id", None)
-                if img_id is not None:
-                    entry = image_depth_scale_map.get(img_id)
-                    if not isinstance(entry, dict):
-                        image_depth_scale_map[img_id] = {"estimated_scale": fallback_scale, "offset": 0.0}
-                    else:
-                        sc = entry.get("estimated_scale")
-                        if sc is None or not np.isfinite(sc) or float(sc) <= 1e-4:
-                            entry["estimated_scale"] = fallback_scale
-                        off = entry.get("offset", 0.0)
-                        if off is None or not np.isfinite(off):
-                            entry["offset"] = 0.0
-
-                d_arr = getattr(ci, "depth", None)
-                if isinstance(d_arr, np.ndarray):
-                    bad_d = ~np.isfinite(d_arr) | (d_arr <= 1e-4)
-                    if np.any(bad_d):
-                        good_d = d_arr[~bad_d]
-                        fill_d = float(np.median(good_d)) if good_d.size > 0 else 1.0
-                        d_clean = np.where(bad_d, fill_d, d_arr).astype(np.float32)
-                        try:
-                            ci = ci._replace(depth=d_clean)
-                        except Exception:
-                            try:
-                                setattr(ci, "depth", d_clean)
-                            except Exception:
-                                pass
-
-        xyz, rgb, normals = orig_gen(cam_infos, cam_intrinsics, num_generated_points, image_depth_scale_map, *g_args, **g_kwargs)
-
-        try:
-            xyz = np.asarray(xyz, dtype=np.float64)
-            rgb = np.asarray(rgb, dtype=np.float64)
-            normals = np.asarray(normals, dtype=np.float64)
-
-            finite_mask = (
-                np.all(np.isfinite(xyz), axis=1)
-                & np.all(np.isfinite(rgb), axis=1)
-                & np.all(np.isfinite(normals), axis=1)
-            )
-            if not np.all(finite_mask):
-                xyz = xyz[finite_mask]
-                rgb = rgb[finite_mask]
-                normals = normals[finite_mask]
-
-            ctx = _get_visual_hull_context()
-            if ctx and len(xyz) > 100:
-                vis_cnt, fg_cnt = _project_points_to_visual_hull(xyz, ctx, min_views=3)
-                fg_ratio = fg_cnt.astype(np.float64) / np.maximum(vis_cnt, 1).astype(np.float64)
-                rgb_max = rgb.max(axis=1) if rgb.ndim == 2 and rgb.shape[1] >= 3 else np.ones(len(xyz))
-                bright_thresh = 5.0 if rgb_max.max() > 1.5 else 0.02
-                keep = (vis_cnt >= 3) & (fg_ratio >= 0.72) & (rgb_max > bright_thresh)
-                if int(keep.sum()) < 500:
-                    keep = (vis_cnt >= 2) & (fg_ratio >= 0.55)
-                if int(keep.sum()) >= 100:
-                    before_n = len(xyz)
-                    xyz = xyz[keep]
-                    rgb = rgb[keep]
-                    normals = normals[keep]
-                    print(
-                        "[VisualHull] Очищено згенеровані точки ініціалізації: %d -> %d (відсіяно %d фонових точок)."
-                        % (before_n, len(xyz), before_n - len(xyz)),
-                        flush=True,
-                    )
-
-            norms_len = np.linalg.norm(normals, axis=1, keepdims=True)
-            bad_n = (norms_len[:, 0] < 1e-8) | (~np.isfinite(norms_len[:, 0]))
-            if np.any(bad_n):
-                normals[bad_n] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-                norms_len = np.linalg.norm(normals, axis=1, keepdims=True)
-            normals = normals / np.maximum(norms_len, 1e-8)
-        except Exception as exc:
-            print("[VisualHull] Попередження у patched_gaussian_generator: %s" % exc, flush=True)
-
-        return xyz, rgb, normals
-
-    mod.gaussian_generator = patched_gaussian_generator
 
 
 def _patch_open3d_io(o3d_mod):
