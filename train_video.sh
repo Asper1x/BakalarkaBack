@@ -305,6 +305,10 @@ ffmpeg \
 
 # Оцінка різкості (Laplacian variance) та фільтрація розмитих кадрів + опціональне маскування фону
 conda activate "$SUGAR_ENV"
+if ! python3 -c "import numpy as np, cv2, matplotlib.pyplot as plt; assert int(np.__version__.split('.')[0]) < 2" >/dev/null 2>&1; then
+    echo "[EnvFix] Виявлено несумісний NumPy 2.x у середовищі $SUGAR_ENV. Відновлюємо сумісний numpy<2.0..."
+    python3 -m pip install -q "numpy>=1.24.0,<2.0.0" "opencv-python-headless<4.10.0" "scipy<1.13.0" "onnxruntime<1.20.0" || true
+fi
 python3 - "$DATASET/input" "$DATASET/frame_quality.json" "$FILTER_BLURRY" "$MASK_FOREGROUND" <<'PYEOF'
 import json
 import os
@@ -573,6 +577,13 @@ rm -f "$DATASET/sparse/0"/*.bin
 conda activate "$SUGAR_ENV"
 cd "$SUGAR_ROOT"
 
+# Перевіряємо сумісність NumPy 1.x ABI у середовищі 2d-sugar ПЕРЕД запуском estimate_depth_normal_priors.py
+# (оскільки matplotlib, PyTorch, Open3D, cv2 у 2d-sugar скомпільовані під numpy<2.0)
+if ! python3 -c "import numpy as np, cv2, matplotlib.pyplot as plt; assert int(np.__version__.split('.')[0]) < 2" >/dev/null 2>&1; then
+    echo "[EnvFix] Виявлено несумісний NumPy 2.x у середовищі $SUGAR_ENV. Відновлюємо сумісний numpy<2.0..."
+    python3 -m pip install -q "numpy>=1.24.0,<2.0.0" "opencv-python-headless<4.10.0" "scipy<1.13.0" "onnxruntime<1.20.0" || true
+fi
+
 # Оцінка глибини та нормалей через Metric3D
 python3 estimate_depth_normal_priors.py -s "$DATASET"
 
@@ -597,7 +608,7 @@ rm -f "$DATASET/sparse/0"/*.bin
 
 # Перевіряємо сумісність NumPy 1.x ABI у середовищі 2d-sugar (PyTorch/Open3D/PyTorch3D/cv2 скомпільовані під numpy<2.0;
 # якщо попередній pip install оновив numpy до 2.x, це викликає SIGSEGV code 139)
-if ! python3 -c "import numpy as np, cv2; assert int(np.__version__.split('.')[0]) < 2" >/dev/null 2>&1; then
+if ! python3 -c "import numpy as np, cv2, matplotlib.pyplot as plt; assert int(np.__version__.split('.')[0]) < 2" >/dev/null 2>&1; then
     echo "[EnvFix] Виявлено несумісний NumPy 2.x або cv2 ABI у середовищі $SUGAR_ENV. Відновлюємо сумісний numpy<2.0..."
     python3 -m pip install -q "numpy>=1.24.0,<2.0.0" "opencv-python-headless<4.10.0" "scipy<1.13.0" "onnxruntime<1.20.0" || true
 fi
