@@ -177,6 +177,44 @@ def _get_visual_hull_context():
         return False
 
 
+def _project_points_to_visual_hull(points_xyz, ctx, min_views=3):
+    import numpy as np
+
+    views, mask_by_stem = ctx
+    n_pts = len(points_xyz)
+    vis_cnt = np.zeros(n_pts, dtype=np.int32)
+    fg_cnt = np.zeros(n_pts, dtype=np.int32)
+    if n_pts == 0 or not views:
+        return vis_cnt, fg_cnt
+
+    for img_name, R, t, (cw, ch, fx, fy, cx, cy) in views:
+        m = mask_by_stem.get(img_name)
+        if m is None:
+            m = mask_by_stem.get(Path(img_name).stem)
+        if m is None:
+            continue
+        mh, mw = m.shape[:2]
+        sx, sy = float(mw) / max(1, cw), float(mh) / max(1, ch)
+        p_cam = points_xyz @ R.T + t
+        z = p_cam[:, 2]
+        valid = z > 0.05
+        idx_v = np.nonzero(valid)[0]
+        if len(idx_v) == 0:
+            continue
+        z_v = z[idx_v]
+        u = np.round((fx * (p_cam[idx_v, 0] / z_v) + cx) * sx).astype(np.int32)
+        v = np.round((fy * (p_cam[idx_v, 1] / z_v) + cy) * sy).astype(np.int32)
+        in_b = (u >= 0) & (u < mw) & (v >= 0) & (v < mh)
+        idx_in = idx_v[in_b]
+        if len(idx_in) == 0:
+            continue
+        vis_cnt[idx_in] += 1
+        is_fg = m[v[in_b], u[in_b]] > 127
+        fg_cnt[idx_in[is_fg]] += 1
+
+    return vis_cnt, fg_cnt
+
+
 def _filter_largest_connected_component(verts, faces, colors=None, min_component_ratio=0.18):
     """
     Keep the primary connected component of triangles (and any secondary component with >= min_component_ratio
@@ -222,9 +260,10 @@ def _filter_largest_connected_component(verts, faces, colors=None, min_component
 
     components.sort(key=len, reverse=True)
     max_len = len(components[0])
+    min_keep = min(max_len, max(16, int(max_len * min_component_ratio)))
     keep_f_mask = np.zeros(len(faces), dtype=bool)
     for comp in components:
-        if len(comp) >= max(16, int(max_len * min_component_ratio)):
+        if len(comp) >= min_keep:
             keep_f_mask[comp] = True
 
     if np.all(keep_f_mask):
@@ -890,10 +929,14 @@ def _repair_open3d_mesh_in_place(mesh, label="mesh", do_watertight=None):
     colors = np.asarray(mesh.vertex_colors, dtype=np.float64) if has_colors else None
 
     verts, faces, colors = _carve_mesh_with_visual_hull_and_clean(verts, faces, colors, label=label)
+    if len(faces) == 0 or len(verts) < 3:
+        return mesh, 0
 
     loops_closed = 0
     if do_watertight:
         verts, faces, colors, loops_closed = _close_mesh_boundaries_numpy(verts, faces, colors)
+        if len(faces) == 0 or len(verts) < 3:
+            return mesh, 0
 
     out_mesh = o3d.geometry.TriangleMesh()
     out_mesh.vertices = o3d.utility.Vector3dVector(verts)
