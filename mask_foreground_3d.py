@@ -206,7 +206,7 @@ def main() -> int:
     core_pts = pts_xyz_arr
     if len(pts_xyz_arr) > 20:
         dists_to_center = np.linalg.norm(pts_xyz_arr - look_at_center, axis=1)
-        core_mask = dists_to_center <= max(cam_radius * 0.85, np.percentile(dists_to_center, 88))
+        core_mask = dists_to_center <= max(cam_radius * 0.55, np.percentile(dists_to_center, 65))
         if np.sum(core_mask) >= 10:
             core_pts = pts_xyz_arr[core_mask]
 
@@ -245,10 +245,10 @@ def main() -> int:
                 in_b = (u >= 0) & (u < w) & (v >= 0) & (v < h)
                 if np.sum(in_b) >= 8:
                     u_in, v_in = u[in_b], v[in_b]
-                    x0 = int(max(0, np.percentile(u_in, 2) - w * 0.24))
-                    x1 = int(min(w, np.percentile(u_in, 98) + w * 0.24))
-                    y0 = int(max(0, np.percentile(v_in, 2) - h * 0.24))
-                    y1 = int(min(h, np.percentile(v_in, 98) + h * 0.24))
+                    x0 = int(max(0, np.percentile(u_in, 2) - w * 0.18))
+                    x1 = int(min(w, np.percentile(u_in, 98) + w * 0.18))
+                    y0 = int(max(0, np.percentile(v_in, 2) - h * 0.18))
+                    y1 = int(min(h, np.percentile(v_in, 98) + h * 0.18))
                     if (x1 - x0) >= w * 0.12 and (y1 - y0) >= h * 0.12:
                         roi_mask.fill(0)
                         roi_mask[y0:y1, x0:x1] = 1
@@ -322,47 +322,53 @@ def main() -> int:
             except Exception:
                 alpha_u8 = (roi_mask * 255).astype(np.uint8)
 
-        # Morphological closing + 3D-ROI component gating (keeps entire connected component that intersects ROI
-        # instead of slicing dark object regions that extend beyond sparse COLMAP keypoints)
+        # Gate by 3D ROI if main object is inside ROI
+        masked_by_roi = np.where(roi_mask > 0, alpha_u8, 0).astype(np.uint8)
+        if np.sum(masked_by_roi > 127) >= (h * w * 0.01):
+            alpha_u8 = masked_by_roi
+
+        # Morphological closing + primary connected component selection
         bin_mask = (alpha_u8 > 110).astype(np.uint8)
         kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, kernel_close)
 
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
-        if num_labels > 1:
-            roi_hits = []
+        if num_labels > 2:
+            best_label = 1
+            best_score = -1.0
+            img_center = np.array([w * 0.5, h * 0.5])
             for lbl in range(1, num_labels):
                 area = float(stats[lbl, cv2.CC_STAT_AREA])
                 if area < (h * w * 0.002):
                     continue
-                comp_mask = labels == lbl
-                overlap_ratio = float(np.sum(comp_mask & (roi_mask > 0))) / max(1.0, area)
-                dist_c = np.linalg.norm(centroids[lbl] - np.array([w * 0.5, h * 0.5])) / max(w, h)
-                score = (area * (0.2 + overlap_ratio)) / (1.0 + 2.0 * dist_c)
-                roi_hits.append((lbl, area, overlap_ratio, score))
+                dist_c = np.linalg.norm(centroids[lbl] - img_center) / max(w, h)
+                score = area / (1.0 + 2.0 * dist_c)
+                if score > best_score:
+                    best_score = score
+                    best_label = lbl
+            keep_comp = (labels == best_label).astype(np.uint8)
+            max_area = float(stats[best_label, cv2.CC_STAT_AREA])
+            for lbl in range(1, num_labels):
+                if lbl != best_label and float(stats[lbl, cv2.CC_STAT_AREA]) >= 0.20 * max_area:
+                    keep_comp[labels == lbl] = 1
+            bin_mask = keep_comp
 
-            if roi_hits:
-                roi_hits.sort(key=lambda item: item[3], reverse=True)
-                best_lbl, max_area, _, _ = roi_hits[0]
-                keep_comp = (labels == best_lbl).astype(np.uint8)
-                for lbl, area, overlap_ratio, _ in roi_hits[1:]:
-                    if overlap_ratio >= 0.15 and area >= 0.05 * max_area:
-                        keep_comp[labels == lbl] = 1
-                if np.sum(keep_comp) >= (h * w * 0.005):
-                    bin_mask = keep_comp
-
-        # 3px boundary erosion + edge RGB decontamination (de-haloing) + strict zero background
+        # 2px boundary erosion + edge RGB decontamination (de-haloing)
         kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         inner_mask = cv2.erode(bin_mask, kernel_erode, iterations=1)
         if np.sum(inner_mask) < 100:
             inner_mask = bin_mask
 
-        eroded_rgb = cv2.erode(rgb, kernel_erode, iterations=2)
-        border_zone = (inner_mask > 0) & (cv2.erode(inner_mask, kernel_erode, iterations=1) == 0)
+        eroded_rgb = cv2.erode(rgb, kernel_erode, iterations=1)
+        border_zone = (bin_mask > 0) & (inner_mask == 0)
         clean_rgb = rgb.copy()
         clean_rgb[border_zone] = eroded_rgb[border_zone]
 
-        out_rgb = np.where(inner_mask[:, :, None] > 0, clean_rgb, 0).astype(np.uint8)
+        soft_alpha = cv2.GaussianBlur(inner_mask.astype(np.float32), (3, 3), 0)
+        soft_alpha = np.where(inner_mask > 0, np.maximum(soft_alpha, 0.85), soft_alpha * 0.5)
+        soft_alpha = np.clip(soft_alpha, 0.0, 1.0)
+
+        out_rgb = (clean_rgb.astype(np.float32) * soft_alpha[:, :, None]).astype(np.uint8)
         Image.fromarray(out_rgb).save(str(img_path), quality=96)
 
         final_mask_u8 = (inner_mask * 255).astype(np.uint8)
@@ -374,14 +380,12 @@ def main() -> int:
             print("[MaskFG] Оброблено %d / %d кадрів..." % (idx_img + 1, len(img_files)), flush=True)
 
     # 3. 3D Visual-Hull pruning of COLMAP points3D.txt and all prior .ply point clouds
-    #    Use strict multi-view consistency (ratio >= 0.80) because table points near the object base
-    #    project through the object silhouette from opposite-side cameras (~40-60% of views).
     sampled_views = views
-    if len(sampled_views) > 60:
-        step = max(1, len(sampled_views) // 60)
+    if len(sampled_views) > 48:
+        step = max(1, len(sampled_views) // 48)
         sampled_views = sampled_views[::step]
 
-    def compute_visual_hull_keep_mask(points_xyz, min_ratio=0.60):
+    def compute_visual_hull_keep_mask(points_xyz):
         if len(points_xyz) == 0 or not sampled_views:
             return np.ones(len(points_xyz), dtype=bool), np.ones(len(points_xyz), dtype=np.float32)
         vis_cnt = np.zeros(len(points_xyz), dtype=np.int32)
@@ -412,31 +416,23 @@ def main() -> int:
             fg_cnt[idx_in[is_fg]] += 1
         ratio = fg_cnt.astype(np.float32) / np.maximum(1, vis_cnt)
         dists = np.linalg.norm(points_xyz - look_at_center, axis=1)
-        score = ratio - 0.12 * (dists / max(0.1, cam_radius))
-        keep = (vis_cnt >= 3) & (ratio >= min_ratio)
-        if np.sum(keep) < min(250, len(points_xyz)):
-            for fallback_r in (0.50, 0.42, 0.35):
-                keep = (vis_cnt >= 2) & (ratio >= fallback_r)
-                if np.sum(keep) >= min(250, len(points_xyz)):
-                    break
-        if np.sum(keep) < min(200, len(points_xyz)):
-            top_k = min(len(points_xyz), max(400, int(len(points_xyz) * 0.20)))
+        score = ratio - 0.15 * (dists / max(0.1, cam_radius))
+        keep = (vis_cnt >= 2) & (ratio >= 0.50)
+        if np.sum(keep) < min(300, len(points_xyz)):
+            top_k = min(len(points_xyz), max(500, int(len(points_xyz) * 0.25)))
             best_idx = np.argsort(score)[-top_k:]
             keep = np.zeros(len(points_xyz), dtype=bool)
             keep[best_idx] = True
         return keep, score
 
     if len(pts_xyz_arr) > 0 and pts3d_txt.is_file():
-        keep_pts, pts_score = compute_visual_hull_keep_mask(pts_xyz_arr, min_ratio=0.60)
+        keep_pts, pts_score = compute_visual_hull_keep_mask(pts_xyz_arr)
 
-        # CRITICAL FOR 2D-SuGaR (dataset_readers.py & point_generator.py):
-        # Every camera (IMAGE_ID) in images.txt MUST retain at least 20 3D points in points3D.txt,
-        # otherwise image_depth_scale_map[cam_info.image_id] is omitted and throws KeyError!
+        # Ensure every camera IMAGE_ID retains >= 20 points so image_depth_scale_map never gets KeyError
         cam_to_pt_indices = {}
         for pt_idx, img_id_list in enumerate(pts_img_ids):
             for iid in set(img_id_list):
                 cam_to_pt_indices.setdefault(iid, []).append(pt_idx)
-
         for iid, pt_indices in cam_to_pt_indices.items():
             kept_for_cam = sum(1 for pi in pt_indices if keep_pts[pi])
             if kept_for_cam < 20 and len(pt_indices) > 0:
@@ -447,7 +443,7 @@ def main() -> int:
         kept_lines = [pts_lines[i] for i in range(len(pts_lines)) if keep_pts[i]]
         pts3d_txt.write_text("\n".join(pts_header + kept_lines) + "\n", encoding="utf-8")
         print(
-            "[MaskFG] Очищено points3D.txt (Visual Hull + гарантія точок для всіх %d камер): залишено %d / %d точок."
+            "[MaskFG] Очищено points3D.txt (Visual Hull, %d камер): залишено %d / %d точок об'єкта."
             % (len(cam_to_pt_indices), len(kept_lines), len(pts_lines)),
             flush=True,
         )
@@ -464,7 +460,7 @@ def main() -> int:
                 if len(v_data) < 100:
                     continue
                 pts_ply = np.column_stack([v_data["x"], v_data["y"], v_data["z"]]).astype(np.float64)
-                keep_ply, _ = compute_visual_hull_keep_mask(pts_ply, min_ratio=0.60)
+                keep_ply, _ = compute_visual_hull_keep_mask(pts_ply)
                 if np.sum(keep_ply) < len(v_data):
                     filtered_v = v_data[keep_ply]
                     PlyData([PlyElement.describe(filtered_v, "vertex")], text=plydata.text).write(str(ply_file))
@@ -478,43 +474,29 @@ def main() -> int:
     except ImportError:
         pass
 
-    # 4. Ensure 2D .npy depth maps have strictly positive finite values (never 0.0!)
-    #    and 3D .npy normal maps have unit-safe non-zero vectors (never [0,0,0] -> 0/0 = NaN!).
-    sanitized_npy_total = 0
-    for npy_f in sorted(dataset_dir.rglob("*.npy")):
-        try:
-            arr = np.load(str(npy_f))
-            orig_shape = arr.shape
-            sq = np.squeeze(arr)
-            if sq.ndim == 2:
-                valid_pos = np.isfinite(sq) & (sq > 1e-3)
-                if np.any(~valid_pos) and np.any(valid_pos):
-                    med_d = float(np.median(sq[valid_pos]))
-                    sq = np.where(valid_pos, sq, max(0.1, med_d)).astype(arr.dtype)
-                    np.save(str(npy_f), sq.reshape(orig_shape))
-                    sanitized_npy_total += 1
-            elif sq.ndim == 3 and sq.shape[2] == 3:
-                nrm = np.linalg.norm(sq, axis=2, keepdims=True)
-                bad_n = (~np.all(np.isfinite(sq), axis=2)) | (nrm[:, :, 0] < 1e-6)
-                if np.any(bad_n):
-                    sq_clean = sq.copy()
-                    sq_clean[bad_n] = np.array([0.0, 0.0, 1.0], dtype=arr.dtype)
-                    np.save(str(npy_f), sq_clean.reshape(orig_shape))
-                    sanitized_npy_total += 1
-            elif sq.ndim == 3 and sq.shape[0] == 3:
-                nrm = np.linalg.norm(sq, axis=0, keepdims=True)
-                bad_n = (~np.all(np.isfinite(sq), axis=0)) | (nrm[0] < 1e-6)
-                if np.any(bad_n):
-                    sq_clean = sq.copy()
-                    sq_clean[0, bad_n] = 0.0
-                    sq_clean[1, bad_n] = 0.0
-                    sq_clean[2, bad_n] = 1.0
-                    np.save(str(npy_f), sq_clean.reshape(orig_shape))
-                    sanitized_npy_total += 1
-        except Exception:
-            pass
-    if sanitized_npy_total > 0:
-        print("[MaskFG] Відновлено валідні значення у %d .npy картах глибини/нормалей." % sanitized_npy_total, flush=True)
+    # 4. Ensure 2D .npy depth maps remain strictly positive & finite (never 0.0!),
+    #    preventing divide-by-zero in dataset_readers.py:256 and depth=0 black Gaussians at camera centers.
+    #    Out-of-object generated Gaussians are pruned in sitecustomize.py's gaussian_generator hook.
+    for depth_sub in ("depths", "depth_priors", "estimated_dense_depth", "depth"):
+        d_dir = dataset_dir / depth_sub
+        if d_dir.is_dir():
+            sanitized_d_cnt = 0
+            for npy_f in sorted(d_dir.glob("*.npy")):
+                try:
+                    arr = np.load(str(npy_f))
+                    orig_shape = arr.shape
+                    sq = np.squeeze(arr)
+                    if sq.ndim == 2:
+                        valid_pos = np.isfinite(sq) & (sq > 1e-3)
+                        if np.any(~valid_pos) and np.any(valid_pos):
+                            med_d = float(np.median(sq[valid_pos]))
+                            sq = np.where(valid_pos, sq, max(0.1, med_d)).astype(arr.dtype)
+                            np.save(str(npy_f), sq.reshape(orig_shape))
+                            sanitized_d_cnt += 1
+                except Exception:
+                    pass
+            if sanitized_d_cnt > 0:
+                print("[MaskFG] Перевірено та відновлено позитивну глибину у %d файлах (%s/)" % (sanitized_d_cnt, depth_sub), flush=True)
 
     return 0
 
