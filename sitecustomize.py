@@ -1022,6 +1022,107 @@ def make_mesh_watertight(mesh_file, force_watertight=None):
 # ==============================================================================
 # 4. Module Import Hooks (GaussianModel LiveStreamer + Open3D + SuGaR Refine)
 # ==============================================================================
+def _patch_point_generator(mod):
+    if mod is None or getattr(mod, "_bakalarka_pg_patched", False):
+        return
+    orig_gen = getattr(mod, "gaussian_generator", None)
+    if not callable(orig_gen):
+        return
+
+    mod._bakalarka_pg_patched = True
+
+    def patched_gaussian_generator(cam_infos, cam_intrinsics, num_generated_points, image_depth_scale_map, *g_args, **g_kwargs):
+        import numpy as np
+
+        if isinstance(image_depth_scale_map, dict):
+            valid_scales = []
+            for v in image_depth_scale_map.values():
+                if isinstance(v, dict):
+                    sc = v.get("estimated_scale")
+                    if sc is not None and np.isfinite(sc) and float(sc) > 1e-4:
+                        valid_scales.append(float(sc))
+            fallback_scale = float(np.median(valid_scales)) if valid_scales else 1.0
+
+            for ci in cam_infos:
+                img_id = getattr(ci, "image_id", None)
+                if img_id is not None:
+                    entry = image_depth_scale_map.get(img_id)
+                    if not isinstance(entry, dict):
+                        image_depth_scale_map[img_id] = {"estimated_scale": fallback_scale, "offset": 0.0}
+                    else:
+                        sc = entry.get("estimated_scale")
+                        if sc is None or not np.isfinite(sc) or float(sc) <= 1e-4:
+                            entry["estimated_scale"] = fallback_scale
+                        off = entry.get("offset", 0.0)
+                        if off is None or not np.isfinite(off):
+                            entry["offset"] = 0.0
+
+                d_arr = getattr(ci, "depth", None)
+                if isinstance(d_arr, np.ndarray):
+                    bad_d = ~np.isfinite(d_arr) | (d_arr <= 1e-4)
+                    if np.any(bad_d):
+                        good_d = d_arr[~bad_d]
+                        fill_d = float(np.median(good_d)) if good_d.size > 0 else 1.0
+                        d_clean = np.where(bad_d, fill_d, d_arr).astype(np.float32)
+                        try:
+                            ci = ci._replace(depth=d_clean)
+                        except Exception:
+                            try:
+                                setattr(ci, "depth", d_clean)
+                            except Exception:
+                                pass
+
+        xyz, rgb, normals = orig_gen(cam_infos, cam_intrinsics, num_generated_points, image_depth_scale_map, *g_args, **g_kwargs)
+
+        try:
+            xyz = np.asarray(xyz, dtype=np.float64)
+            rgb = np.asarray(rgb, dtype=np.float64)
+            normals = np.asarray(normals, dtype=np.float64)
+
+            finite_mask = (
+                np.all(np.isfinite(xyz), axis=1)
+                & np.all(np.isfinite(rgb), axis=1)
+                & np.all(np.isfinite(normals), axis=1)
+            )
+            if not np.all(finite_mask):
+                xyz = xyz[finite_mask]
+                rgb = rgb[finite_mask]
+                normals = normals[finite_mask]
+
+            ctx = _get_visual_hull_context()
+            if ctx and len(xyz) > 100:
+                vis_cnt, fg_cnt = _project_points_to_visual_hull(xyz, ctx, min_views=3)
+                fg_ratio = fg_cnt.astype(np.float64) / np.maximum(vis_cnt, 1).astype(np.float64)
+                rgb_max = rgb.max(axis=1) if rgb.ndim == 2 and rgb.shape[1] >= 3 else np.ones(len(xyz))
+                bright_thresh = 5.0 if rgb_max.max() > 1.5 else 0.02
+                keep = (vis_cnt >= 3) & (fg_ratio >= 0.72) & (rgb_max > bright_thresh)
+                if int(keep.sum()) < 500:
+                    keep = (vis_cnt >= 2) & (fg_ratio >= 0.55)
+                if int(keep.sum()) >= 100:
+                    before_n = len(xyz)
+                    xyz = xyz[keep]
+                    rgb = rgb[keep]
+                    normals = normals[keep]
+                    print(
+                        "[VisualHull] Очищено згенеровані точки ініціалізації: %d -> %d (відсіяно %d фонових точок)."
+                        % (before_n, len(xyz), before_n - len(xyz)),
+                        flush=True,
+                    )
+
+            norms_len = np.linalg.norm(normals, axis=1, keepdims=True)
+            bad_n = (norms_len[:, 0] < 1e-8) | (~np.isfinite(norms_len[:, 0]))
+            if np.any(bad_n):
+                normals[bad_n] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                norms_len = np.linalg.norm(normals, axis=1, keepdims=True)
+            normals = normals / np.maximum(norms_len, 1e-8)
+        except Exception as exc:
+            print("[VisualHull] Попередження у patched_gaussian_generator: %s" % exc, flush=True)
+
+        return xyz, rgb, normals
+
+    mod.gaussian_generator = patched_gaussian_generator
+
+
 def _patch_open3d_io(o3d_mod):
     if not (_watertight_flag or _mask_fg_flag or _get_visual_hull_context()):
         return
@@ -1172,6 +1273,26 @@ try:
                 )
                 if refine_mod is not None:
                     _patch_refine_module(refine_mod)
+            except Exception:
+                pass
+
+        # Hook 4: scene.point_generator / scene.dataset_readers for safe depth scaling & Visual-Hull point filtering
+        if (
+            "point_generator" in name
+            or "dataset_readers" in name
+            or name == "scene"
+            or name.endswith(".scene")
+        ):
+            try:
+                for mod_candidate in (
+                    mod,
+                    sys.modules.get("scene.point_generator"),
+                    sys.modules.get("scene.dataset_readers"),
+                    getattr(mod, "point_generator", None),
+                    getattr(mod, "dataset_readers", None),
+                ):
+                    if mod_candidate is not None:
+                        _patch_point_generator(mod_candidate)
             except Exception:
                 pass
 

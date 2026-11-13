@@ -178,10 +178,11 @@ def main() -> int:
         except Exception:
             pass
 
-    # Read 3D points from points3D.txt
+    # Read 3D points from points3D.txt (including per-point camera TRACK[] image_ids in parts[8::2])
     pts3d_txt = sparse_dir / "points3D.txt"
     pts_xyz = []
     pts_lines = []
+    pts_img_ids = []
     pts_header = []
     if pts3d_txt.is_file():
         for raw_line in pts3d_txt.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -193,6 +194,13 @@ def main() -> int:
             if len(parts) >= 8:
                 pts_xyz.append([float(parts[1]), float(parts[2]), float(parts[3])])
                 pts_lines.append(raw_line)
+                track_imgs = []
+                for k in range(8, len(parts), 2):
+                    try:
+                        track_imgs.append(int(parts[k]))
+                    except Exception:
+                        pass
+                pts_img_ids.append(track_imgs)
 
     pts_xyz_arr = np.array(pts_xyz, dtype=np.float64) if pts_xyz else np.zeros((0, 3), dtype=np.float64)
     core_pts = pts_xyz_arr
@@ -375,9 +383,9 @@ def main() -> int:
         step = max(1, len(sampled_views) // 60)
         sampled_views = sampled_views[::step]
 
-    def compute_visual_hull_keep_mask(points_xyz, min_ratio=0.80):
+    def compute_visual_hull_keep_mask(points_xyz, min_ratio=0.78):
         if len(points_xyz) == 0 or not sampled_views:
-            return np.ones(len(points_xyz), dtype=bool)
+            return np.ones(len(points_xyz), dtype=bool), np.ones(len(points_xyz), dtype=np.float32)
         vis_cnt = np.zeros(len(points_xyz), dtype=np.int32)
         fg_cnt = np.zeros(len(points_xyz), dtype=np.int32)
         for img_name, R, t, (cw, ch, fx, fy, cx, cy) in sampled_views:
@@ -405,6 +413,8 @@ def main() -> int:
             is_fg = m[v[in_b], u[in_b]] > 127
             fg_cnt[idx_in[is_fg]] += 1
         ratio = fg_cnt.astype(np.float32) / np.maximum(1, vis_cnt)
+        dists = np.linalg.norm(points_xyz - look_at_center, axis=1)
+        score = ratio - 0.12 * (dists / max(0.1, cam_radius))
         keep = (vis_cnt >= 3) & (ratio >= min_ratio)
         if np.sum(keep) < min(250, len(points_xyz)):
             for fallback_r in (0.70, 0.60, 0.50):
@@ -412,21 +422,35 @@ def main() -> int:
                 if np.sum(keep) >= min(250, len(points_xyz)):
                     break
         if np.sum(keep) < min(200, len(points_xyz)):
-            dists = np.linalg.norm(points_xyz - look_at_center, axis=1)
-            score = ratio - 0.15 * (dists / max(0.1, cam_radius))
             top_k = min(len(points_xyz), max(400, int(len(points_xyz) * 0.20)))
             best_idx = np.argsort(score)[-top_k:]
             keep = np.zeros(len(points_xyz), dtype=bool)
             keep[best_idx] = True
-        return keep
+        return keep, score
 
     if len(pts_xyz_arr) > 0 and pts3d_txt.is_file():
-        keep_pts = compute_visual_hull_keep_mask(pts_xyz_arr, min_ratio=0.80)
+        keep_pts, pts_score = compute_visual_hull_keep_mask(pts_xyz_arr, min_ratio=0.78)
+
+        # CRITICAL FOR 2D-SuGaR (dataset_readers.py & point_generator.py):
+        # Every camera (IMAGE_ID) in images.txt MUST retain at least 20 3D points in points3D.txt,
+        # otherwise image_depth_scale_map[cam_info.image_id] is omitted and throws KeyError!
+        cam_to_pt_indices = {}
+        for pt_idx, img_id_list in enumerate(pts_img_ids):
+            for iid in set(img_id_list):
+                cam_to_pt_indices.setdefault(iid, []).append(pt_idx)
+
+        for iid, pt_indices in cam_to_pt_indices.items():
+            kept_for_cam = sum(1 for pi in pt_indices if keep_pts[pi])
+            if kept_for_cam < 20 and len(pt_indices) > 0:
+                sorted_for_cam = sorted(pt_indices, key=lambda pi: float(pts_score[pi]), reverse=True)
+                for pi in sorted_for_cam[: min(20, len(sorted_for_cam))]:
+                    keep_pts[pi] = True
+
         kept_lines = [pts_lines[i] for i in range(len(pts_lines)) if keep_pts[i]]
         pts3d_txt.write_text("\n".join(pts_header + kept_lines) + "\n", encoding="utf-8")
         print(
-            "[MaskFG] Очищено points3D.txt (Visual Hull, min_ratio=0.80): залишено %d / %d точок об'єкта."
-            % (len(kept_lines), len(pts_lines)),
+            "[MaskFG] Очищено points3D.txt (Visual Hull + гарантія точок для всіх %d камер): залишено %d / %d точок."
+            % (len(cam_to_pt_indices), len(kept_lines), len(pts_lines)),
             flush=True,
         )
 
@@ -442,7 +466,7 @@ def main() -> int:
                 if len(v_data) < 100:
                     continue
                 pts_ply = np.column_stack([v_data["x"], v_data["y"], v_data["z"]]).astype(np.float64)
-                keep_ply = compute_visual_hull_keep_mask(pts_ply, min_ratio=0.80)
+                keep_ply, _ = compute_visual_hull_keep_mask(pts_ply, min_ratio=0.78)
                 if np.sum(keep_ply) < len(v_data):
                     filtered_v = v_data[keep_ply]
                     PlyData([PlyElement.describe(filtered_v, "vertex")], text=plydata.text).write(str(ply_file))
@@ -456,48 +480,27 @@ def main() -> int:
     except ImportError:
         pass
 
-    # 4. Mask ALL .npy depth and normal prior maps across dataset subdirectories so 2D-SuGaR regularization
-    #    does not spawn black Gaussians on the table/background
-    masked_npy_total = 0
+    # 4. Ensure 2D .npy depth maps have strictly positive finite values (never 0.0!),
+    #    because dataset_readers.py:256 computes `scale = camera_coord[2] / prior_depth` without zero-checks;
+    #    0.0 in prior_depth causes divide-by-zero -> inf -> NaN -> KeyError in point_generator.py!
+    #    (Filtering of generated 3D points is handled directly in sitecustomize.py's gaussian_generator hook.)
+    sanitized_npy_total = 0
     for npy_f in sorted(dataset_dir.rglob("*.npy")):
-        m = mask_by_name.get(npy_f.stem)
-        if m is None:
-            continue
         try:
             arr = np.load(str(npy_f))
             orig_shape = arr.shape
             sq = np.squeeze(arr)
             if sq.ndim == 2:
-                mh, mw = sq.shape[:2]
-                m_resized = (
-                    cv2.resize(m, (mw, mh), interpolation=cv2.INTER_NEAREST) if m.shape[:2] != (mh, mw) else m
-                )
-                sq = np.where(m_resized > 127, sq, 0.0).astype(arr.dtype)
-                np.save(str(npy_f), sq.reshape(orig_shape))
-                masked_npy_total += 1
-            elif sq.ndim == 3:
-                if sq.shape[0] in (1, 3, 4) and sq.shape[2] not in (1, 3, 4):
-                    # (C, H, W)
-                    mh, mw = sq.shape[1], sq.shape[2]
-                    m_resized = (
-                        cv2.resize(m, (mw, mh), interpolation=cv2.INTER_NEAREST) if m.shape[:2] != (mh, mw) else m
-                    )
-                    sq = np.where(m_resized[None, :, :] > 127, sq, 0.0).astype(arr.dtype)
+                valid_pos = np.isfinite(sq) & (sq > 1e-3)
+                if np.any(~valid_pos) and np.any(valid_pos):
+                    med_d = float(np.median(sq[valid_pos]))
+                    sq = np.where(valid_pos, sq, max(0.1, med_d)).astype(arr.dtype)
                     np.save(str(npy_f), sq.reshape(orig_shape))
-                    masked_npy_total += 1
-                elif sq.shape[2] in (1, 3, 4):
-                    # (H, W, C)
-                    mh, mw = sq.shape[0], sq.shape[1]
-                    m_resized = (
-                        cv2.resize(m, (mw, mh), interpolation=cv2.INTER_NEAREST) if m.shape[:2] != (mh, mw) else m
-                    )
-                    sq = np.where(m_resized[:, :, None] > 127, sq, 0.0).astype(arr.dtype)
-                    np.save(str(npy_f), sq.reshape(orig_shape))
-                    masked_npy_total += 1
+                    sanitized_npy_total += 1
         except Exception:
             pass
-    if masked_npy_total > 0:
-        print("[MaskFG] Замасковано %d .npy карт глибини та нормалей." % masked_npy_total, flush=True)
+    if sanitized_npy_total > 0:
+        print("[MaskFG] Відновлено позитивні значення у %d .npy картах глибини." % sanitized_npy_total, flush=True)
 
     return 0
 
