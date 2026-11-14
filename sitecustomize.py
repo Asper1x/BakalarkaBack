@@ -216,16 +216,19 @@ def _project_points_to_visual_hull(points_xyz, ctx):
 
 
 # ==============================================================================
-# 3. Watertight Mesh Hole-Closing (Open3D + Pure NumPy Multi-Ring Smooth Cap)
+# 3. Watertight Mesh Hole-Closing (Open3D + Advancing-Front 2-to-1 Ring Reduction)
 # ==============================================================================
 def _close_mesh_boundaries_numpy(verts, faces, colors=None):
     """
-    Topological boundary-loop detector and smooth concentric-ring membrane triangulator.
-    Detects open boundary edges via undirected edge triangle incidence == 1, traces all
-    closed boundary cycles, and seals both small holes and large base openings with a
-    smooth Laplacian-faired membrane cap while interpolating vertex colors.
+    Topological boundary-loop detector and 2-to-1 advancing-front membrane triangulator.
+    Detects open boundary edges via undirected edge triangle incidence == 1 across
+    multi-scale spatial welding passes, prunes dead-end boundary spurs, traces both
+    closed boundary cycles and open boundary chains, and seals both small holes and
+    large base openings using 2-to-1 ring reduction (M -> M // 2) so no vertex ever
+    exceeds degree 8 (preventing starburst/spoke-wheel artifacts).
     Returns (repaired_verts, repaired_faces, repaired_colors, holes_closed_count).
     """
+    import math
     import numpy as np
     from collections import Counter, defaultdict
 
@@ -238,8 +241,14 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
     if has_colors:
         colors = np.asarray(colors)
 
-    # Step A: Weld duplicate vertices at identical 3D positions (e.g. TSDF sub-volume block seams)
-    quant = np.round(verts * 1e5).astype(np.int64)
+    bbox_min = verts.min(axis=0)
+    bbox_max = verts.max(axis=0)
+    bbox_diag = float(np.linalg.norm(bbox_max - bbox_min))
+    if bbox_diag < 1e-6:
+        bbox_diag = 1.0
+
+    # Step A: Exact-tolerance vertex welding (TSDF block seams)
+    quant = np.round((verts - bbox_min) * (25000.0 / bbox_diag)).astype(np.int64)
     _, unique_v_idx, inv_v_idx = np.unique(quant, axis=0, return_index=True, return_inverse=True)
     if len(unique_v_idx) < len(verts):
         order = np.argsort(unique_v_idx)
@@ -267,27 +276,49 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
     colors_list = [colors] if has_colors else None
     total_loops_closed = 0
 
-    for _pass in range(3):
-        # Extract all 3 directed half-edges per triangle
-        h0 = faces[:, [0, 1]]
-        h1 = faces[:, [1, 2]]
-        h2 = faces[:, [2, 0]]
+    quant_factors = (
+        25000.0 / bbox_diag,
+        2500.0 / bbox_diag,
+        450.0 / bbox_diag,
+    )
+
+    for q_factor in quant_factors:
+        cur_verts = np.vstack(verts_list)
+        cur_colors = np.vstack(colors_list) if colors_list is not None else None
+
+        # Build spatial weld mapping for boundary detection at current scale
+        q_coords = np.round((cur_verts - bbox_min) * q_factor).astype(np.int64)
+        _, u_idx, weld_of = np.unique(q_coords, axis=0, return_index=True, return_inverse=True)
+        rep_vid = u_idx[weld_of]
+
+        w_faces = rep_vid[faces]
+        valid_wf = (
+            (w_faces[:, 0] != w_faces[:, 1])
+            & (w_faces[:, 1] != w_faces[:, 2])
+            & (w_faces[:, 2] != w_faces[:, 0])
+        )
+        w_faces_clean = w_faces[valid_wf]
+        if len(w_faces_clean) == 0:
+            break
+
+        h0 = w_faces_clean[:, [0, 1]]
+        h1 = w_faces_clean[:, [1, 2]]
+        h2 = w_faces_clean[:, [2, 0]]
         all_he = np.vstack([h0, h1, h2])
 
-        # Count undirected edge occurrences across all triangles.
-        # An edge {min(u,v), max(u,v)} is on an open hole boundary iff it belongs to strictly 1 triangle.
         u_min = np.minimum(all_he[:, 0], all_he[:, 1])
         u_max = np.maximum(all_he[:, 0], all_he[:, 1])
         undir_edges = np.column_stack([u_min, u_max])
         undir_counts = Counter(map(tuple, undir_edges.tolist()))
 
-        # Build undirected boundary adjacency graph + preferred reversed half-edge orientation
         undir_adj = defaultdict(list)
         pref_dir = set()
         boundary_edges = set()
 
         for u, v in all_he.tolist():
             u_i, v_i = int(u), int(v)
+            if u_i == v_i:
+                continue
             key = (min(u_i, v_i), max(u_i, v_i))
             if undir_counts[key] == 1 and key not in boundary_edges:
                 boundary_edges.add(key)
@@ -299,98 +330,199 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
         if not boundary_edges:
             break
 
-        cur_verts = np.vstack(verts_list)
-        cur_colors = np.vstack(colors_list) if colors_list is not None else None
+        # Prune dead-end degree-1 spurs only where they attach to branch vertices (degree >= 3)
+        used_edges = set()
+        for _prune_it in range(4):
+            pruned_any = False
+            for u, nbs in list(undir_adj.items()):
+                alive = [
+                    nb for nb in nbs
+                    if (min(u, nb), max(u, nb)) not in used_edges
+                ]
+                if len(alive) == 1:
+                    nb = alive[0]
+                    nb_alive = [
+                        w for w in undir_adj[nb]
+                        if (min(nb, w), max(nb, w)) not in used_edges
+                    ]
+                    if len(nb_alive) >= 3:
+                        used_edges.add((min(u, nb), max(u, nb)))
+                        pruned_any = True
+            if not pruned_any:
+                break
+
         next_vid = int(cur_verts.shape[0])
         new_faces = [faces]
         loops_in_pass = 0
-        used_edges = set()
 
-        def _seal_loop(loop_nodes):
+        def _seal_loop(raw_loop_nodes):
             nonlocal next_vid, loops_in_pass
+            # Deduplicate consecutive repeated nodes
+            loop_nodes = []
+            for nid in raw_loop_nodes:
+                if not loop_nodes or loop_nodes[-1] != nid:
+                    loop_nodes.append(int(nid))
+            if len(loop_nodes) > 1 and loop_nodes[0] == loop_nodes[-1]:
+                loop_nodes.pop()
+
             L = len(loop_nodes)
             if L < 3:
                 return
+
             # Orient loop consistently with pref_dir
-            fwd_score = sum(1 for i in range(L) if (loop_nodes[i], loop_nodes[(i + 1) % L]) in pref_dir)
-            rev_score = sum(1 for i in range(L) if (loop_nodes[(i + 1) % L], loop_nodes[i]) in pref_dir)
+            fwd_score = sum(
+                1 for i in range(L)
+                if (loop_nodes[i], loop_nodes[(i + 1) % L]) in pref_dir
+            )
+            rev_score = sum(
+                1 for i in range(L)
+                if (loop_nodes[(i + 1) % L], loop_nodes[i]) in pref_dir
+            )
             if rev_score > fwd_score:
                 loop_nodes = list(reversed(loop_nodes))
 
             if L == 3:
-                new_faces.append(np.array([[loop_nodes[0], loop_nodes[1], loop_nodes[2]]], dtype=np.int64))
+                new_faces.append(
+                    np.array([[loop_nodes[0], loop_nodes[1], loop_nodes[2]]], dtype=np.int64)
+                )
+                loops_in_pass += 1
+                return
+
+            if L == 4:
+                p0, p1, p2, p3 = [cur_verts[idx] for idx in loop_nodes]
+                if np.linalg.norm(p0 - p2) <= np.linalg.norm(p1 - p3):
+                    new_faces.append(
+                        np.array(
+                            [
+                                [loop_nodes[0], loop_nodes[1], loop_nodes[2]],
+                                [loop_nodes[0], loop_nodes[2], loop_nodes[3]],
+                            ],
+                            dtype=np.int64,
+                        )
+                    )
+                else:
+                    new_faces.append(
+                        np.array(
+                            [
+                                [loop_nodes[0], loop_nodes[1], loop_nodes[3]],
+                                [loop_nodes[1], loop_nodes[2], loop_nodes[3]],
+                            ],
+                            dtype=np.int64,
+                        )
+                    )
                 loops_in_pass += 1
                 return
 
             idx_arr = np.array(loop_nodes, dtype=np.int64)
-            loop_pts = cur_verts[idx_arr]
-            centroid = loop_pts.mean(axis=0, keepdims=True)
-            loop_cols = cur_colors[idx_arr] if (colors_list is not None and cur_colors is not None) else None
-            c_mean = loop_cols.mean(axis=0, keepdims=True) if loop_cols is not None else None
+            curr_pts = cur_verts[idx_arr].copy()
+            centroid = curr_pts.mean(axis=0, keepdims=True)
+            curr_cols = (
+                cur_colors[idx_arr].copy().astype(np.float64)
+                if (colors_list is not None and cur_colors is not None)
+                else None
+            )
+            c_mean = curr_cols.mean(axis=0, keepdims=True) if curr_cols is not None else None
+            curr_ids = list(loop_nodes)
 
-            if L <= 12:
-                verts_list.append(centroid)
-                if colors_list is not None and c_mean is not None:
-                    if np.issubdtype(cur_colors.dtype, np.integer):
-                        c_mean = np.clip(np.round(c_mean), 0, 255).astype(cur_colors.dtype)
-                    colors_list.append(c_mean)
-                center_vid = next_vid
-                next_vid += 1
-                fan = np.array(
-                    [[loop_nodes[i], loop_nodes[(i + 1) % L], center_vid] for i in range(L)],
-                    dtype=np.int64,
+            # 2-to-1 Advancing-Front Ring Reduction:
+            # Halve ring vertex count (M -> M // 2) at each concentric step until M <= 8.
+            # Every vertex in the cap has degree <= 8 (never creates a high-degree starburst hub).
+            while len(curr_ids) > 8:
+                M = len(curr_ids)
+                next_M = max(4, M // 2)
+
+                # Smooth contour before halving
+                sm_pts = curr_pts.copy()
+                sm_cols = curr_cols.copy() if curr_cols is not None else None
+                for _ in range(2):
+                    sm_pts = (
+                        0.25 * np.roll(sm_pts, 1, axis=0)
+                        + 0.50 * sm_pts
+                        + 0.25 * np.roll(sm_pts, -1, axis=0)
+                    )
+                    if sm_cols is not None:
+                        sm_cols = (
+                            0.25 * np.roll(sm_cols, 1, axis=0)
+                            + 0.50 * sm_cols
+                            + 0.25 * np.roll(sm_cols, -1, axis=0)
+                        )
+
+                steps_rem = max(1.0, math.log2(M / 4.0))
+                alpha = min(0.42, max(0.18, 1.0 / (steps_rem + 0.8)))
+
+                next_pts = np.empty((next_M, 3), dtype=np.float64)
+                next_cols = (
+                    np.empty((next_M, curr_cols.shape[1]), dtype=np.float64)
+                    if (curr_cols is not None and sm_cols is not None)
+                    else None
                 )
-                new_faces.append(fan)
-                loops_in_pass += 1
-                return
+                next_ids = []
 
-            # Multi-ring smooth membrane cap for larger holes (L > 12, e.g. object base)
-            ring_fracs = (0.28, 0.56, 0.80)
-            prev_ring_ids = loop_nodes
-            curr_ring_pts = loop_pts.copy()
-            curr_ring_cols = loop_cols.copy() if loop_cols is not None else None
+                for j in range(next_M):
+                    src0 = (2 * j) % M
+                    src1 = (2 * j + 1) % M
+                    mid_pt = 0.5 * (sm_pts[src0] + sm_pts[src1])
+                    next_pts[j] = (1.0 - alpha) * mid_pt + alpha * centroid[0]
+                    if next_cols is not None and sm_cols is not None and c_mean is not None:
+                        mid_col = 0.5 * (sm_cols[src0] + sm_cols[src1])
+                        next_cols[j] = (1.0 - alpha) * mid_col + alpha * c_mean[0]
+                    next_ids.append(next_vid)
+                    next_vid += 1
 
-            for frac in ring_fracs:
-                # Smooth along loop contour before contracting toward centroid
-                for _ in range(3):
-                    curr_ring_pts = 0.25 * np.roll(curr_ring_pts, 1, axis=0) + 0.5 * curr_ring_pts + 0.25 * np.roll(curr_ring_pts, -1, axis=0)
-                    if curr_ring_cols is not None:
-                        curr_ring_cols = 0.25 * np.roll(curr_ring_cols, 1, axis=0) + 0.5 * curr_ring_cols + 0.25 * np.roll(curr_ring_cols, -1, axis=0)
-
-                ring_pts = (1.0 - frac) * curr_ring_pts + frac * centroid
-                verts_list.append(ring_pts)
-                if colors_list is not None and curr_ring_cols is not None and c_mean is not None:
-                    ring_cols = (1.0 - frac) * curr_ring_cols + frac * c_mean
+                verts_list.append(next_pts)
+                if colors_list is not None and next_cols is not None and cur_colors is not None:
+                    out_cols = next_cols
                     if np.issubdtype(cur_colors.dtype, np.integer):
-                        ring_cols = np.clip(np.round(ring_cols), 0, 255).astype(cur_colors.dtype)
-                    colors_list.append(ring_cols)
+                        out_cols = np.clip(np.round(out_cols), 0, 255).astype(cur_colors.dtype)
+                    else:
+                        out_cols = out_cols.astype(cur_colors.dtype)
+                    colors_list.append(out_cols)
 
-                ring_ids = [next_vid + i for i in range(L)]
-                next_vid += L
-
-                # Connect prev_ring_ids to ring_ids with 2L triangles
                 strip_tris = []
-                for i in range(L):
-                    ni = (i + 1) % L
-                    a0, a1 = prev_ring_ids[i], prev_ring_ids[ni]
-                    b0, b1 = ring_ids[i], ring_ids[ni]
-                    strip_tris.append([a0, a1, b1])
-                    strip_tris.append([a0, b1, b0])
-                new_faces.append(np.array(strip_tris, dtype=np.int64))
-                prev_ring_ids = ring_ids
+                for j in range(next_M):
+                    nj = (j + 1) % next_M
+                    b0 = next_ids[j]
+                    b1 = next_ids[nj]
+                    if j < next_M - 1 or M == 2 * next_M:
+                        i0 = 2 * j
+                        i1 = (2 * j + 1) % M
+                        i2 = (2 * j + 2) % M
+                        u0, u1, u2 = curr_ids[i0], curr_ids[i1], curr_ids[i2]
+                        strip_tris.append([u0, u1, b0])
+                        strip_tris.append([u1, b1, b0])
+                        strip_tris.append([u1, u2, b1])
+                    else:
+                        # Odd remainder: 3 outer edges -> 1 inner edge (4 triangles)
+                        i0 = 2 * j
+                        i1 = (2 * j + 1) % M
+                        i2 = (2 * j + 2) % M
+                        i3 = 0
+                        u0, u1, u2, u3 = curr_ids[i0], curr_ids[i1], curr_ids[i2], curr_ids[i3]
+                        strip_tris.append([u0, u1, b0])
+                        strip_tris.append([u1, u2, b0])
+                        strip_tris.append([u2, b1, b0])
+                        strip_tris.append([u2, u3, b1])
 
-            # Connect innermost ring to center vertex
+                new_faces.append(np.array(strip_tris, dtype=np.int64))
+                curr_ids = next_ids
+                curr_pts = next_pts
+                curr_cols = next_cols
+
+            # Close remaining small core (len(curr_ids) <= 8) with a tiny center vertex (degree <= 8)
+            K = len(curr_ids)
             verts_list.append(centroid)
-            if colors_list is not None and c_mean is not None:
+            if colors_list is not None and c_mean is not None and cur_colors is not None:
                 c_out = c_mean
                 if np.issubdtype(cur_colors.dtype, np.integer):
                     c_out = np.clip(np.round(c_out), 0, 255).astype(cur_colors.dtype)
+                else:
+                    c_out = c_out.astype(cur_colors.dtype)
                 colors_list.append(c_out)
             center_vid = next_vid
             next_vid += 1
 
             fan = np.array(
-                [[prev_ring_ids[i], prev_ring_ids[(i + 1) % L], center_vid] for i in range(L)],
+                [[curr_ids[i], curr_ids[(i + 1) % K], center_vid] for i in range(K)],
                 dtype=np.int64,
             )
             new_faces.append(fan)
@@ -406,9 +538,11 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
             used_edges.add(e_start)
             path_nodes = [u0, v0]
             visited_idx = {u0: 0, v0: 1}
-            curr = v0
+            longest_open_chain = [u0, v0]
+            closed_any = False
 
-            while True:
+            while len(path_nodes) >= 2:
+                curr = path_nodes[-1]
                 candidates = []
                 for nb in undir_adj[curr]:
                     ek = (min(curr, nb), max(curr, nb))
@@ -416,14 +550,23 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
                         candidates.append((nb, ek))
 
                 if not candidates:
-                    break
+                    if len(path_nodes) > len(longest_open_chain):
+                        longest_open_chain = list(path_nodes)
+                    dead = path_nodes.pop()
+                    visited_idx.pop(dead, None)
+                    continue
 
-                # Prefer edge oriented (curr -> nb) in pref_dir, or one closing a cycle
+                # Prefer cycle closure, then preferred half-edge orientation
                 chosen_nb, chosen_ek = candidates[0]
                 for nb, ek in candidates:
-                    if (curr, nb) in pref_dir:
+                    if nb in visited_idx and len(path_nodes) - visited_idx[nb] >= 3:
                         chosen_nb, chosen_ek = nb, ek
                         break
+                else:
+                    for nb, ek in candidates:
+                        if (curr, nb) in pref_dir:
+                            chosen_nb, chosen_ek = nb, ek
+                            break
 
                 used_edges.add(chosen_ek)
                 if chosen_nb in visited_idx:
@@ -431,19 +574,51 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
                     loop = path_nodes[loop_start:]
                     if len(loop) >= 3:
                         _seal_loop(loop)
+                        closed_any = True
                     for removed in path_nodes[loop_start + 1 :]:
                         visited_idx.pop(removed, None)
                     path_nodes = path_nodes[: loop_start + 1]
-                    curr = chosen_nb
                 else:
                     visited_idx[chosen_nb] = len(path_nodes)
                     path_nodes.append(chosen_nb)
-                    curr = chosen_nb
+
+            # If a hole boundary was broken by a non-manifold edge into an open chain,
+            # extend backward from u0 as well and seal if endpoints form a valid contour
+            if not closed_any:
+                back_nodes = []
+                curr_back = u0
+                visited_back = set(longest_open_chain)
+                while True:
+                    back_cands = []
+                    for nb in undir_adj[curr_back]:
+                        ek = (min(curr_back, nb), max(curr_back, nb))
+                        if ek not in used_edges and nb not in visited_back:
+                            back_cands.append((nb, ek))
+                    if not back_cands:
+                        break
+                    chosen_nb, chosen_ek = back_cands[0]
+                    for nb, ek in back_cands:
+                        if (nb, curr_back) in pref_dir:
+                            chosen_nb, chosen_ek = nb, ek
+                            break
+                    used_edges.add(chosen_ek)
+                    back_nodes.append(chosen_nb)
+                    visited_back.add(chosen_nb)
+                    curr_back = chosen_nb
+
+                full_chain = list(reversed(back_nodes)) + longest_open_chain
+                if len(full_chain) >= 3:
+                    a_id, b_id = full_chain[0], full_chain[-1]
+                    gap_dist = float(np.linalg.norm(cur_verts[a_id] - cur_verts[b_id]))
+                    chain_pts = cur_verts[np.array(full_chain, dtype=np.int64)]
+                    chain_perim = float(np.linalg.norm(chain_pts[1:] - chain_pts[:-1], axis=1).sum())
+                    if gap_dist < chain_perim * 0.85:
+                        _seal_loop(full_chain)
 
         faces = np.vstack(new_faces)
         total_loops_closed += loops_in_pass
         if loops_in_pass == 0:
-            break
+            continue
 
     final_verts = np.vstack(verts_list)
     final_colors = np.vstack(colors_list) if colors_list is not None else None
@@ -454,8 +629,14 @@ def _make_obj_watertight(path):
     """
     Close all open boundary loops in a Wavefront .obj file while preserving
     existing UV coordinates (vt), normals (vn), mtllib, and usemtl directives.
+    Uses spatial 3D vertex welding so UV seams never split hole boundaries, and
+    seals holes with 2-to-1 Advancing-Front Ring Reduction (max vertex degree <= 8)
+    and a single representative UV per cap to prevent UV texture stretching or
+    frontend spoke-filter deletion.
     """
+    import math
     import numpy as np
+    from collections import Counter, defaultdict
 
     path = Path(path)
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -492,16 +673,39 @@ def _make_obj_watertight(path):
         return False
 
     orig_v_count = len(verts)
-    orig_f_count = len(faces_v)
     verts_arr = np.asarray(verts, dtype=np.float64)
     faces_arr = np.asarray(faces_v, dtype=np.int64)
 
-    # For OBJ we run without reordering existing vertex indices so original UV/normal indices stay valid
-    from collections import Counter, defaultdict
+    bbox_min = verts_arr.min(axis=0)
+    bbox_max = verts_arr.max(axis=0)
+    bbox_diag = float(np.linalg.norm(bbox_max - bbox_min))
+    if bbox_diag < 1e-6:
+        bbox_diag = 1.0
 
-    h0 = faces_arr[:, [0, 1]]
-    h1 = faces_arr[:, [1, 2]]
-    h2 = faces_arr[:, [2, 0]]
+    # Weld vertices by 3D spatial position so UV seams do not split hole loops
+    quant = np.round((verts_arr - bbox_min) * (25000.0 / bbox_diag)).astype(np.int64)
+    _, u_idx, weld_inv = np.unique(quant, axis=0, return_index=True, return_inverse=True)
+    rep_vid = u_idx[weld_inv]
+
+    # Propagate UV mapping to welded representative vertices
+    for v_orig, vt_idx in list(face_v_to_vt.items()):
+        w_rep = int(rep_vid[v_orig])
+        if w_rep not in face_v_to_vt:
+            face_v_to_vt[w_rep] = vt_idx
+
+    w_faces = rep_vid[faces_arr]
+    valid_wf = (
+        (w_faces[:, 0] != w_faces[:, 1])
+        & (w_faces[:, 1] != w_faces[:, 2])
+        & (w_faces[:, 2] != w_faces[:, 0])
+    )
+    w_faces = w_faces[valid_wf]
+    if len(w_faces) == 0:
+        return False
+
+    h0 = w_faces[:, [0, 1]]
+    h1 = w_faces[:, [1, 2]]
+    h2 = w_faces[:, [2, 0]]
     all_he = np.vstack([h0, h1, h2])
     u_min = np.minimum(all_he[:, 0], all_he[:, 1])
     u_max = np.maximum(all_he[:, 0], all_he[:, 1])
@@ -527,13 +731,159 @@ def _make_obj_watertight(path):
 
     has_vt = len(vts) > 0 and len(face_v_to_vt) > 0
     vts_arr = np.asarray(vts, dtype=np.float64) if has_vt else None
-    next_v_idx = orig_v_count + 1
-    next_vt_idx = len(vts) + 1
+    next_v_idx = orig_v_count + 1  # 1-based OBJ vertex index
+    next_vt_idx = len(vts) + 1     # 1-based OBJ vt index
     append_v_lines = []
     append_vt_lines = []
     append_f_lines = []
     loops_closed = 0
     used_edges = set()
+
+    # Prune degree-1 dead-end spurs at branch vertices
+    for _prune_it in range(4):
+        pruned_any = False
+        for u, nbs in list(undir_adj.items()):
+            alive = [nb for nb in nbs if (min(u, nb), max(u, nb)) not in used_edges]
+            if len(alive) == 1:
+                nb = alive[0]
+                nb_alive = [w for w in undir_adj[nb] if (min(nb, w), max(nb, w)) not in used_edges]
+                if len(nb_alive) >= 3:
+                    used_edges.add((min(u, nb), max(u, nb)))
+                    pruned_any = True
+        if not pruned_any:
+            break
+
+    def _emit_obj_tri(idx_a, vt_a, idx_b, vt_b, idx_c, vt_c):
+        # idx_a, idx_b, idx_c are 1-based OBJ vertex indices
+        if has_vt:
+            append_f_lines.append("f %d/%d %d/%d %d/%d" % (idx_a, vt_a, idx_b, vt_b, idx_c, vt_c))
+        else:
+            append_f_lines.append("f %d %d %d" % (idx_a, idx_b, idx_c))
+
+    def _seal_obj_loop(raw_loop):
+        nonlocal next_v_idx, next_vt_idx, loops_closed
+        loop = []
+        for nid in raw_loop:
+            if not loop or loop[-1] != nid:
+                loop.append(int(nid))
+        if len(loop) > 1 and loop[0] == loop[-1]:
+            loop.pop()
+
+        L = len(loop)
+        if L < 3:
+            return
+
+        fwd_score = sum(1 for i in range(L) if (loop[i], loop[(i + 1) % L]) in pref_dir)
+        rev_score = sum(1 for i in range(L) if (loop[(i + 1) % L], loop[i]) in pref_dir)
+        if rev_score > fwd_score:
+            loop = list(reversed(loop))
+
+        # Pick ONE representative UV coordinate from the boundary to avoid UV island stretching
+        rep_vt_1based = 1
+        if has_vt and vts_arr is not None:
+            for n in loop:
+                if n in face_v_to_vt and 0 <= face_v_to_vt[n] < len(vts_arr):
+                    uv = vts_arr[face_v_to_vt[n]]
+                    append_vt_lines.append("vt %.6f %.6f" % (uv[0], uv[1]))
+                    rep_vt_1based = next_vt_idx
+                    next_vt_idx += 1
+                    break
+
+        if L == 3:
+            v1, v2, v3 = loop[0] + 1, loop[1] + 1, loop[2] + 1
+            t1 = face_v_to_vt.get(loop[0], 0) + 1 if has_vt else 1
+            t2 = face_v_to_vt.get(loop[1], 0) + 1 if has_vt else 1
+            t3 = face_v_to_vt.get(loop[2], 0) + 1 if has_vt else 1
+            _emit_obj_tri(v1, t1, v2, t2, v3, t3)
+            loops_closed += 1
+            return
+
+        if L == 4:
+            v0, v1, v2, v3 = [n + 1 for n in loop]
+            t0 = face_v_to_vt.get(loop[0], 0) + 1 if has_vt else 1
+            t1 = face_v_to_vt.get(loop[1], 0) + 1 if has_vt else 1
+            t2 = face_v_to_vt.get(loop[2], 0) + 1 if has_vt else 1
+            t3 = face_v_to_vt.get(loop[3], 0) + 1 if has_vt else 1
+            _emit_obj_tri(v0, t0, v1, t1, v2, t2)
+            _emit_obj_tri(v0, t0, v2, t2, v3, t3)
+            loops_closed += 1
+            return
+
+        curr_pts = verts_arr[np.array(loop, dtype=np.int64)].copy()
+        centroid = curr_pts.mean(axis=0)
+        # Store 1-based (v_idx, vt_idx) pairs for current ring
+        curr_ring = [
+            (n + 1, (face_v_to_vt.get(n, 0) + 1) if has_vt else 1)
+            for n in loop
+        ]
+
+        while len(curr_ring) > 8:
+            M = len(curr_ring)
+            next_M = max(4, M // 2)
+            sm_pts = curr_pts.copy()
+            for _ in range(2):
+                sm_pts = (
+                    0.25 * np.roll(sm_pts, 1, axis=0)
+                    + 0.50 * sm_pts
+                    + 0.25 * np.roll(sm_pts, -1, axis=0)
+                )
+            steps_rem = max(1.0, math.log2(M / 4.0))
+            alpha = min(0.42, max(0.18, 1.0 / (steps_rem + 0.8)))
+
+            next_pts = np.empty((next_M, 3), dtype=np.float64)
+            next_ring = []
+            for j in range(next_M):
+                src0 = (2 * j) % M
+                src1 = (2 * j + 1) % M
+                mid_pt = 0.5 * (sm_pts[src0] + sm_pts[src1])
+                pt = (1.0 - alpha) * mid_pt + alpha * centroid
+                next_pts[j] = pt
+                append_v_lines.append("v %.6f %.6f %.6f" % (pt[0], pt[1], pt[2]))
+                next_ring.append((next_v_idx, rep_vt_1based))
+                next_v_idx += 1
+
+            for j in range(next_M):
+                nj = (j + 1) % next_M
+                b0_v, b0_t = next_ring[j]
+                b1_v, b1_t = next_ring[nj]
+                if j < next_M - 1 or M == 2 * next_M:
+                    i0 = 2 * j
+                    i1 = (2 * j + 1) % M
+                    i2 = (2 * j + 2) % M
+                    u0_v, u0_t = curr_ring[i0]
+                    u1_v, u1_t = curr_ring[i1]
+                    u2_v, u2_t = curr_ring[i2]
+                    _emit_obj_tri(u0_v, u0_t, u1_v, u1_t, b0_v, b0_t)
+                    _emit_obj_tri(u1_v, u1_t, b1_v, b1_t, b0_v, b0_t)
+                    _emit_obj_tri(u1_v, u1_t, u2_v, u2_t, b1_v, b1_t)
+                else:
+                    i0 = 2 * j
+                    i1 = (2 * j + 1) % M
+                    i2 = (2 * j + 2) % M
+                    i3 = 0
+                    u0_v, u0_t = curr_ring[i0]
+                    u1_v, u1_t = curr_ring[i1]
+                    u2_v, u2_t = curr_ring[i2]
+                    u3_v, u3_t = curr_ring[i3]
+                    _emit_obj_tri(u0_v, u0_t, u1_v, u1_t, b0_v, b0_t)
+                    _emit_obj_tri(u1_v, u1_t, u2_v, u2_t, b0_v, b0_t)
+                    _emit_obj_tri(u2_v, u2_t, b1_v, b1_t, b0_v, b0_t)
+                    _emit_obj_tri(u2_v, u2_t, u3_v, u3_t, b1_v, b1_t)
+
+            curr_ring = next_ring
+            curr_pts = next_pts
+
+        # Close remaining <= 8 core
+        K = len(curr_ring)
+        append_v_lines.append("v %.6f %.6f %.6f" % (centroid[0], centroid[1], centroid[2]))
+        c_v_idx = next_v_idx
+        next_v_idx += 1
+        for i in range(K):
+            a_v, a_t = curr_ring[i]
+            b_v, b_t = curr_ring[(i + 1) % K]
+            _emit_obj_tri(a_v, a_t, b_v, b_t, c_v_idx, rep_vt_1based)
+
+        loops_closed += 1
 
     for e_start in list(boundary_edges):
         if e_start in used_edges:
@@ -544,70 +894,78 @@ def _make_obj_watertight(path):
         used_edges.add(e_start)
         path_nodes = [u0, v0]
         visited_idx = {u0: 0, v0: 1}
-        curr = v0
+        longest_open_chain = [u0, v0]
+        closed_any = False
 
-        while True:
+        while len(path_nodes) >= 2:
+            curr = path_nodes[-1]
             candidates = [
                 (nb, (min(curr, nb), max(curr, nb)))
                 for nb in undir_adj[curr]
                 if (min(curr, nb), max(curr, nb)) not in used_edges
             ]
             if not candidates:
-                break
+                if len(path_nodes) > len(longest_open_chain):
+                    longest_open_chain = list(path_nodes)
+                dead = path_nodes.pop()
+                visited_idx.pop(dead, None)
+                continue
+
             chosen_nb, chosen_ek = candidates[0]
             for nb, ek in candidates:
-                if (curr, nb) in pref_dir:
+                if nb in visited_idx and len(path_nodes) - visited_idx[nb] >= 3:
                     chosen_nb, chosen_ek = nb, ek
                     break
+            else:
+                for nb, ek in candidates:
+                    if (curr, nb) in pref_dir:
+                        chosen_nb, chosen_ek = nb, ek
+                        break
+
             used_edges.add(chosen_ek)
             if chosen_nb in visited_idx:
                 loop_start = visited_idx[chosen_nb]
                 loop = path_nodes[loop_start:]
-                L = len(loop)
-                if L >= 3:
-                    fwd_score = sum(1 for i in range(L) if (loop[i], loop[(i + 1) % L]) in pref_dir)
-                    rev_score = sum(1 for i in range(L) if (loop[(i + 1) % L], loop[i]) in pref_dir)
-                    if rev_score > fwd_score:
-                        loop = list(reversed(loop))
-                    if L == 3:
-                        v1, v2, v3 = loop[0] + 1, loop[1] + 1, loop[2] + 1
-                        if has_vt:
-                            t1 = face_v_to_vt.get(loop[0], 0) + 1
-                            t2 = face_v_to_vt.get(loop[1], 0) + 1
-                            t3 = face_v_to_vt.get(loop[2], 0) + 1
-                            append_f_lines.append("f %d/%d %d/%d %d/%d" % (v1, t1, v2, t2, v3, t3))
-                        else:
-                            append_f_lines.append("f %d %d %d" % (v1, v2, v3))
-                    else:
-                        c_xyz = verts_arr[np.array(loop, dtype=np.int64)].mean(axis=0)
-                        append_v_lines.append("v %.6f %.6f %.6f" % (c_xyz[0], c_xyz[1], c_xyz[2]))
-                        c_v_idx = next_v_idx
-                        next_v_idx += 1
-                        c_vt_idx = 1
-                        if has_vt and vts_arr is not None:
-                            nb_uvs = [vts_arr[face_v_to_vt[n]] for n in loop if n in face_v_to_vt and face_v_to_vt[n] < len(vts_arr)]
-                            uv = np.mean(nb_uvs, axis=0) if nb_uvs else np.array([0.5, 0.5])
-                            append_vt_lines.append("vt %.6f %.6f" % (uv[0], uv[1]))
-                            c_vt_idx = next_vt_idx
-                            next_vt_idx += 1
-                        for i in range(L):
-                            a = loop[i]
-                            b = loop[(i + 1) % L]
-                            if has_vt:
-                                ta = face_v_to_vt.get(a, 0) + 1
-                                tb = face_v_to_vt.get(b, 0) + 1
-                                append_f_lines.append("f %d/%d %d/%d %d/%d" % (a + 1, ta, b + 1, tb, c_v_idx, c_vt_idx))
-                            else:
-                                append_f_lines.append("f %d %d %d" % (a + 1, b + 1, c_v_idx))
-                    loops_closed += 1
+                if len(loop) >= 3:
+                    _seal_obj_loop(loop)
+                    closed_any = True
                 for removed in path_nodes[loop_start + 1 :]:
                     visited_idx.pop(removed, None)
                 path_nodes = path_nodes[: loop_start + 1]
-                curr = chosen_nb
             else:
                 visited_idx[chosen_nb] = len(path_nodes)
                 path_nodes.append(chosen_nb)
-                curr = chosen_nb
+
+        if not closed_any:
+            back_nodes = []
+            curr_back = u0
+            visited_back = set(longest_open_chain)
+            while True:
+                back_cands = [
+                    (nb, (min(curr_back, nb), max(curr_back, nb)))
+                    for nb in undir_adj[curr_back]
+                    if (min(curr_back, nb), max(curr_back, nb)) not in used_edges and nb not in visited_back
+                ]
+                if not back_cands:
+                    break
+                chosen_nb, chosen_ek = back_cands[0]
+                for nb, ek in back_cands:
+                    if (nb, curr_back) in pref_dir:
+                        chosen_nb, chosen_ek = nb, ek
+                        break
+                used_edges.add(chosen_ek)
+                back_nodes.append(chosen_nb)
+                visited_back.add(chosen_nb)
+                curr_back = chosen_nb
+
+            full_chain = list(reversed(back_nodes)) + longest_open_chain
+            if len(full_chain) >= 3:
+                a_id, b_id = full_chain[0], full_chain[-1]
+                gap_dist = float(np.linalg.norm(verts_arr[a_id] - verts_arr[b_id]))
+                chain_pts = verts_arr[np.array(full_chain, dtype=np.int64)]
+                chain_perim = float(np.linalg.norm(chain_pts[1:] - chain_pts[:-1], axis=1).sum())
+                if gap_dist < chain_perim * 0.85:
+                    _seal_obj_loop(full_chain)
 
     if append_f_lines:
         out_block = ["", "# Watertight hole-closing cap"] + append_v_lines + append_vt_lines + append_f_lines
