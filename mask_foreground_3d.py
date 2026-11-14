@@ -474,9 +474,10 @@ def main() -> int:
     except ImportError:
         pass
 
-    # 4. Ensure 2D .npy depth maps remain strictly positive & finite (never 0.0!),
-    #    preventing divide-by-zero in dataset_readers.py:256 and depth=0 black Gaussians at camera centers.
-    #    Out-of-object generated Gaussians are pruned in sitecustomize.py's gaussian_generator hook.
+    # 4. Background pixels in .npy depth priors -> FAR depth (never 0.0 and never a fake median plane).
+    #    0.0 causes divide-by-zero in dataset_readers.py:256; a median value tells the depth regularizer
+    #    that a surface exists in the background (grows a "skirt"). Far depth pushes background beyond
+    #    depth_trunc so it can't become geometry.
     for depth_sub in ("depths", "depth_priors", "estimated_dense_depth", "depth"):
         d_dir = dataset_dir / depth_sub
         if d_dir.is_dir():
@@ -485,18 +486,28 @@ def main() -> int:
                 try:
                     arr = np.load(str(npy_f))
                     orig_shape = arr.shape
-                    sq = np.squeeze(arr)
-                    if sq.ndim == 2:
-                        valid_pos = np.isfinite(sq) & (sq > 1e-3)
-                        if np.any(~valid_pos) and np.any(valid_pos):
-                            med_d = float(np.median(sq[valid_pos]))
-                            sq = np.where(valid_pos, sq, max(0.1, med_d)).astype(arr.dtype)
-                            np.save(str(npy_f), sq.reshape(orig_shape))
-                            sanitized_d_cnt += 1
+                    sq = np.squeeze(arr).astype(np.float32)
+                    if sq.ndim != 2:
+                        continue
+                    valid_pos = np.isfinite(sq) & (sq > 1e-3)
+                    if not np.any(valid_pos):
+                        continue
+                    m = mask_by_name.get(npy_f.stem)
+                    if m is not None:
+                        mh, mw = sq.shape
+                        m_r = cv2.resize(m, (mw, mh), interpolation=cv2.INTER_NEAREST) if m.shape[:2] != (mh, mw) else m
+                        fg = (m_r > 127) & valid_pos
+                    else:
+                        fg = valid_pos
+                    ref = sq[fg] if np.any(fg) else sq[valid_pos]
+                    far_d = float(np.percentile(ref, 99)) * 10.0
+                    out = np.where(fg, sq, far_d).astype(arr.dtype)
+                    np.save(str(npy_f), out.reshape(orig_shape))
+                    sanitized_d_cnt += 1
                 except Exception:
                     pass
             if sanitized_d_cnt > 0:
-                print("[MaskFG] Перевірено та відновлено позитивну глибину у %d файлах (%s/)" % (sanitized_d_cnt, depth_sub), flush=True)
+                print("[MaskFG] Фон у %d картах глибини відсунуто на далеку відстань (%s/)" % (sanitized_d_cnt, depth_sub), flush=True)
 
     return 0
 

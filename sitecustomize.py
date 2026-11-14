@@ -959,6 +959,191 @@ def _patch_point_generator(mod):
     mod._bakalarka_pg_patched = True
 
 
+# ==============================================================================
+# Visual-Hull guards for training (Gaussian pruning) and TSDF mesh extraction (depth masking)
+# ==============================================================================
+_FULL_MASKS_CACHE = None
+_TORCH_VH_CACHE = None
+
+
+def _get_all_masks_by_stem():
+    """All foreground masks ($DATASET/masks/*.png) keyed by stem (not subsampled)."""
+    global _FULL_MASKS_CACHE
+    if _FULL_MASKS_CACHE is not None:
+        return _FULL_MASKS_CACHE
+    _FULL_MASKS_CACHE = {}
+    if not _mask_fg_flag:
+        return _FULL_MASKS_CACHE
+    ds_dir = _resolve_dataset_dir()
+    if ds_dir is None or not (ds_dir / "masks").is_dir():
+        return _FULL_MASKS_CACHE
+    try:
+        import numpy as np
+        from PIL import Image
+
+        for mf in sorted((ds_dir / "masks").glob("*.png")):
+            try:
+                _FULL_MASKS_CACHE[mf.stem] = np.asarray(Image.open(str(mf)).convert("L"), dtype=np.uint8)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return _FULL_MASKS_CACHE
+
+
+def _get_torch_visual_hull(device):
+    """Per-view tensors (R, t, fx, fy, cx, cy, mask) on GPU for fast Gaussian projection."""
+    global _TORCH_VH_CACHE
+    if _TORCH_VH_CACHE is not None:
+        return _TORCH_VH_CACHE
+    _TORCH_VH_CACHE = False
+    ctx = _get_visual_hull_context()
+    if not ctx:
+        return False
+    try:
+        import numpy as np
+        import torch
+
+        views, mask_by_stem = ctx
+        packed = []
+        for img_name, R, t, (cw, ch, fx, fy, cx, cy) in views:
+            m = mask_by_stem.get(img_name)
+            if m is None:
+                m = mask_by_stem.get(Path(img_name).stem)
+            if m is None:
+                continue
+            mh, mw = m.shape[:2]
+            sx, sy = float(mw) / max(1, cw), float(mh) / max(1, ch)
+            packed.append(
+                (
+                    torch.tensor(R, dtype=torch.float32, device=device),
+                    torch.tensor(t, dtype=torch.float32, device=device),
+                    float(fx * sx),
+                    float(fy * sy),
+                    float(cx * sx),
+                    float(cy * sy),
+                    torch.from_numpy((m > 127).astype(np.uint8)).to(device),
+                )
+            )
+        if packed:
+            _TORCH_VH_CACHE = packed
+    except Exception:
+        _TORCH_VH_CACHE = False
+    return _TORCH_VH_CACHE
+
+
+def _visual_hull_outside_mask_torch(xyz):
+    """Boolean tensor: True for Gaussians that lie outside the object's 3D Visual Hull."""
+    import torch
+
+    packed = _get_torch_visual_hull(xyz.device)
+    if not packed:
+        return None
+    with torch.no_grad():
+        n = xyz.shape[0]
+        vis_cnt = torch.zeros(n, dtype=torch.int32, device=xyz.device)
+        fg_cnt = torch.zeros(n, dtype=torch.int32, device=xyz.device)
+        for R, t, fx, fy, cx, cy, m in packed:
+            p = xyz @ R.T + t
+            z = p[:, 2]
+            valid = z > 0.05
+            zs = torch.where(valid, z, torch.ones_like(z))
+            u = torch.round(fx * p[:, 0] / zs + cx).long()
+            v = torch.round(fy * p[:, 1] / zs + cy).long()
+            mh, mw = m.shape
+            inb = valid & (u >= 0) & (u < mw) & (v >= 0) & (v < mh)
+            uc = u.clamp(0, mw - 1)
+            vc = v.clamp(0, mh - 1)
+            fg = (m[vc, uc] > 0) & inb
+            vis_cnt += inb.int()
+            fg_cnt += fg.int()
+        ratio = fg_cnt.float() / vis_cnt.clamp(min=1).float()
+        # A point seen by >= 3 cameras but inside the silhouette in < 50% of them is background
+        return (vis_cnt >= 3) & (ratio < 0.5)
+
+
+def _patch_gaussian_model_pruning(mod):
+    target_cls = getattr(mod, "GaussianModel", None)
+    if target_cls is None or getattr(target_cls, "_bakalarka_vh_prune_patched", False):
+        return
+    orig_dp = getattr(target_cls, "densify_and_prune", None)
+    if not callable(orig_dp) or not callable(getattr(target_cls, "prune_points", None)):
+        return
+    target_cls._bakalarka_vh_prune_patched = True
+
+    def patched_densify_and_prune(self, *a, **kw):
+        res = orig_dp(self, *a, **kw)
+        try:
+            outside = _visual_hull_outside_mask_torch(self.get_xyz.detach())
+            if outside is not None:
+                n_out = int(outside.sum().item())
+                n_all = int(outside.shape[0])
+                # Safety: never wipe the model if masks/poses are inconsistent
+                if 0 < n_out < int(n_all * 0.7):
+                    self.prune_points(outside)
+                    print(
+                        "[VisualHull] Видалено %d / %d гаусіанів поза об'єктом під час навчання." % (n_out, n_all),
+                        flush=True,
+                    )
+        except Exception as exc:
+            print("[VisualHull] Попередження під час прунінгу: %s" % exc, flush=True)
+        return res
+
+    target_cls.densify_and_prune = patched_densify_and_prune
+
+
+def _patch_mesh_extractor(mod):
+    """Zero rendered depth outside the (slightly dilated) foreground mask before TSDF fusion."""
+    target_cls = getattr(mod, "GaussianExtractor", None)
+    if target_cls is None or getattr(target_cls, "_bakalarka_vh_extract_patched", False):
+        return
+    orig_recon = getattr(target_cls, "reconstruction", None)
+    if not callable(orig_recon):
+        return
+    target_cls._bakalarka_vh_extract_patched = True
+
+    def patched_reconstruction(self, *a, **kw):
+        res = orig_recon(self, *a, **kw)
+        masks = _get_all_masks_by_stem()
+        if not masks:
+            return res
+        try:
+            import cv2
+            import numpy as np
+            import torch
+
+            cams = getattr(self, "viewpoint_stack", None) or []
+            depthmaps = getattr(self, "depthmaps", None)
+            alphamaps = getattr(self, "alphamaps", None)
+            if not depthmaps:
+                return res
+            masked = 0
+            for i, cam in enumerate(cams):
+                if i >= len(depthmaps):
+                    break
+                stem = Path(str(getattr(cam, "image_name", ""))).stem
+                m = masks.get(stem)
+                if m is None:
+                    continue
+                d = depthmaps[i]
+                h, w = int(d.shape[-2]), int(d.shape[-1])
+                mr = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+                k = max(3, int(round(min(h, w) * 0.01)) * 2 + 1)
+                mr = cv2.dilate(mr, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+                keep = torch.from_numpy((mr > 127).astype(np.float32)).to(d.device)
+                depthmaps[i] = d * keep.view(*([1] * (d.dim() - 2)), h, w)
+                if alphamaps is not None and i < len(alphamaps):
+                    a_t = alphamaps[i]
+                    alphamaps[i] = a_t * keep.to(a_t.device).view(*([1] * (a_t.dim() - 2)), h, w)
+                masked += 1
+            print("[VisualHull] Замасковано фон у %d картах глибини перед TSDF-злиттям." % masked, flush=True)
+        except Exception as exc:
+            print("[VisualHull] Попередження при маскуванні глибини: %s" % exc, flush=True)
+        return res
+
+    target_cls.reconstruction = patched_reconstruction
+
+
 def _patch_refine_module(refine_mod):
     if getattr(refine_mod, "_bakalarka_refine_patched", False):
         return
@@ -1083,6 +1268,20 @@ try:
                 )
                 if refine_mod is not None:
                     _patch_refine_module(refine_mod)
+            except Exception:
+                pass
+
+        # Hook 5: Visual-Hull Gaussian pruning during training + depth masking before TSDF mesh fusion
+        if _mask_fg_flag:
+            try:
+                if "gaussian_model" in name or name == "scene" or name.endswith(".scene"):
+                    for cand in (mod, sys.modules.get("scene.gaussian_model"), getattr(mod, "gaussian_model", None)):
+                        if cand is not None:
+                            _patch_gaussian_model_pruning(cand)
+                if "mesh_utils" in name or name == "utils" or name.endswith(".utils"):
+                    for cand in (mod, sys.modules.get("utils.mesh_utils"), getattr(mod, "mesh_utils", None)):
+                        if cand is not None:
+                            _patch_mesh_extractor(cand)
             except Exception:
                 pass
 
