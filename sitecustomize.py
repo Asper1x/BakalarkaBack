@@ -278,8 +278,9 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
 
     quant_factors = (
         25000.0 / bbox_diag,
-        2500.0 / bbox_diag,
-        450.0 / bbox_diag,
+        3000.0 / bbox_diag,
+        600.0 / bbox_diag,
+        180.0 / bbox_diag,
     )
 
     for q_factor in quant_factors:
@@ -332,7 +333,7 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
 
         # Prune dead-end degree-1 spurs only where they attach to branch vertices (degree >= 3)
         used_edges = set()
-        for _prune_it in range(4):
+        for _prune_it in range(8):
             pruned_any = False
             for u, nbs in list(undir_adj.items()):
                 alive = [
@@ -357,38 +358,43 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
 
         def _seal_loop(raw_loop_nodes):
             nonlocal next_vid, loops_in_pass
-            # Deduplicate consecutive repeated nodes
+            # Deduplicate consecutive repeated nodes and collapse immediate u -> v -> u hairpins
             loop_nodes = []
             for nid in raw_loop_nodes:
-                if not loop_nodes or loop_nodes[-1] != nid:
-                    loop_nodes.append(int(nid))
-            if len(loop_nodes) > 1 and loop_nodes[0] == loop_nodes[-1]:
+                nid_i = int(nid)
+                if loop_nodes and loop_nodes[-1] == nid_i:
+                    continue
+                if len(loop_nodes) >= 2 and loop_nodes[-2] == nid_i:
+                    loop_nodes.pop()
+                    continue
+                loop_nodes.append(nid_i)
+            while len(loop_nodes) > 2 and loop_nodes[0] == loop_nodes[-1]:
                 loop_nodes.pop()
 
-            L = len(loop_nodes)
-            if L < 3:
+            L0 = len(loop_nodes)
+            if L0 < 3:
                 return
 
             # Orient loop consistently with pref_dir
             fwd_score = sum(
-                1 for i in range(L)
-                if (loop_nodes[i], loop_nodes[(i + 1) % L]) in pref_dir
+                1 for i in range(L0)
+                if (loop_nodes[i], loop_nodes[(i + 1) % L0]) in pref_dir
             )
             rev_score = sum(
-                1 for i in range(L)
-                if (loop_nodes[(i + 1) % L], loop_nodes[i]) in pref_dir
+                1 for i in range(L0)
+                if (loop_nodes[(i + 1) % L0], loop_nodes[i]) in pref_dir
             )
             if rev_score > fwd_score:
                 loop_nodes = list(reversed(loop_nodes))
 
-            if L == 3:
+            if L0 == 3:
                 new_faces.append(
                     np.array([[loop_nodes[0], loop_nodes[1], loop_nodes[2]]], dtype=np.int64)
                 )
                 loops_in_pass += 1
                 return
 
-            if L == 4:
+            if L0 == 4:
                 p0, p1, p2, p3 = [cur_verts[idx] for idx in loop_nodes]
                 if np.linalg.norm(p0 - p2) <= np.linalg.norm(p1 - p3):
                     new_faces.append(
@@ -413,16 +419,74 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
                 loops_in_pass += 1
                 return
 
-            idx_arr = np.array(loop_nodes, dtype=np.int64)
-            curr_pts = cur_verts[idx_arr].copy()
-            centroid = curr_pts.mean(axis=0, keepdims=True)
+            # Subdivide any long bridged gap (> 2.2x median loop edge) so all sides of the hole
+            # have uniform vertex density before 2-to-1 ring reduction
+            pts0 = cur_verts[np.array(loop_nodes, dtype=np.int64)]
+            seg_d = np.linalg.norm(np.roll(pts0, -1, axis=0) - pts0, axis=1)
+            valid_d = seg_d[seg_d > 1e-6]
+            med_edge = float(np.median(valid_d)) if len(valid_d) > 0 else bbox_diag * 0.015
+
+            ring_ids = []
+            ring_pts_list = []
+            ring_cols_list = []
+            sub_verts_new = []
+            sub_cols_new = []
+
+            for i in range(L0):
+                u_id = loop_nodes[i]
+                v_id = loop_nodes[(i + 1) % L0]
+                p_u = cur_verts[u_id]
+                p_v = cur_verts[v_id]
+                c_u = (
+                    cur_colors[u_id].astype(np.float64)
+                    if (colors_list is not None and cur_colors is not None)
+                    else None
+                )
+                c_v = (
+                    cur_colors[v_id].astype(np.float64)
+                    if (colors_list is not None and cur_colors is not None)
+                    else None
+                )
+                ring_ids.append(u_id)
+                ring_pts_list.append(p_u)
+                if c_u is not None:
+                    ring_cols_list.append(c_u)
+
+                d_uv = float(np.linalg.norm(p_v - p_u))
+                if med_edge > 1e-6 and d_uv > med_edge * 2.2:
+                    n_sub = min(48, int(math.ceil(d_uv / med_edge)) - 1)
+                    for s in range(1, n_sub + 1):
+                        t = float(s) / float(n_sub + 1)
+                        sp = (1.0 - t) * p_u + t * p_v
+                        sub_verts_new.append(sp)
+                        ring_ids.append(next_vid)
+                        next_vid += 1
+                        ring_pts_list.append(sp)
+                        if c_u is not None and c_v is not None:
+                            sc = (1.0 - t) * c_u + t * c_v
+                            sub_cols_new.append(sc)
+                            ring_cols_list.append(sc)
+
+            if sub_verts_new:
+                verts_list.append(np.array(sub_verts_new, dtype=np.float64))
+                if colors_list is not None and sub_cols_new and cur_colors is not None:
+                    sc_arr = np.array(sub_cols_new, dtype=np.float64)
+                    if np.issubdtype(cur_colors.dtype, np.integer):
+                        sc_arr = np.clip(np.round(sc_arr), 0, 255).astype(cur_colors.dtype)
+                    else:
+                        sc_arr = sc_arr.astype(cur_colors.dtype)
+                    colors_list.append(sc_arr)
+
+            curr_pts = np.array(ring_pts_list, dtype=np.float64)
+            seg_w = np.linalg.norm(np.roll(curr_pts, -1, axis=0) - curr_pts, axis=1, keepdims=True) + 1e-7
+            centroid = (0.5 * (curr_pts + np.roll(curr_pts, -1, axis=0)) * seg_w).sum(axis=0, keepdims=True) / seg_w.sum()
             curr_cols = (
-                cur_colors[idx_arr].copy().astype(np.float64)
-                if (colors_list is not None and cur_colors is not None)
+                np.array(ring_cols_list, dtype=np.float64)
+                if ring_cols_list
                 else None
             )
             c_mean = curr_cols.mean(axis=0, keepdims=True) if curr_cols is not None else None
-            curr_ids = list(loop_nodes)
+            curr_ids = list(ring_ids)
 
             # 2-to-1 Advancing-Front Ring Reduction:
             # Halve ring vertex count (M -> M // 2) at each concentric step until M <= 8.
@@ -528,6 +592,8 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
             new_faces.append(fan)
             loops_in_pass += 1
 
+        open_chains = []
+
         for e_start in list(boundary_edges):
             if e_start in used_edges:
                 continue
@@ -538,10 +604,9 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
             used_edges.add(e_start)
             path_nodes = [u0, v0]
             visited_idx = {u0: 0, v0: 1}
-            longest_open_chain = [u0, v0]
-            closed_any = False
+            spur_backtracks = 0
 
-            while len(path_nodes) >= 2:
+            while len(path_nodes) > 0:
                 curr = path_nodes[-1]
                 candidates = []
                 for nb in undir_adj[curr]:
@@ -550,23 +615,50 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
                         candidates.append((nb, ek))
 
                 if not candidates:
-                    if len(path_nodes) > len(longest_open_chain):
-                        longest_open_chain = list(path_nodes)
-                    dead = path_nodes.pop()
-                    visited_idx.pop(dead, None)
-                    continue
-
-                # Prefer cycle closure, then preferred half-edge orientation
-                chosen_nb, chosen_ek = candidates[0]
-                for nb, ek in candidates:
-                    if nb in visited_idx and len(path_nodes) - visited_idx[nb] >= 3:
-                        chosen_nb, chosen_ek = nb, ek
-                        break
-                else:
-                    for nb, ek in candidates:
-                        if (curr, nb) in pref_dir:
-                            chosen_nb, chosen_ek = nb, ek
+                    # Only backtrack if an ancestor within <= 24 steps still has unused boundary edges
+                    branch_k = -1
+                    for k in range(len(path_nodes) - 2, -1, -1):
+                        nk = path_nodes[k]
+                        if any((min(nk, w), max(nk, w)) not in used_edges for w in undir_adj[nk]):
+                            branch_k = k
                             break
+                    if branch_k != -1 and (len(path_nodes) - 1 - branch_k) <= 24 and spur_backtracks <= 32:
+                        while len(path_nodes) > branch_k + 1:
+                            dead = path_nodes.pop()
+                            visited_idx.pop(dead, None)
+                        spur_backtracks += 1
+                        continue
+                    break
+
+                spur_backtracks = 0
+                has_unvisited_cont = any(
+                    nb not in visited_idx
+                    and any((min(nb, w), max(nb, w)) not in used_edges and (min(nb, w), max(nb, w)) != ek for w in undir_adj[nb])
+                    for nb, ek in candidates
+                )
+
+                # Prefer major cycle closure, or continuing unvisited preferred edge
+                chosen_nb, chosen_ek = candidates[0]
+                best_sc = -1e9
+                for nb, ek in candidates:
+                    sc = 1.0
+                    if nb in visited_idx and len(path_nodes) - visited_idx[nb] >= 3:
+                        cyc_len = len(path_nodes) - visited_idx[nb]
+                        if visited_idx[nb] == 0 or cyc_len >= 16 or not has_unvisited_cont:
+                            sc = 200.0
+                        else:
+                            sc = 5.0
+                    else:
+                        rem_d = sum(1 for w in undir_adj[nb] if (min(nb, w), max(nb, w)) not in used_edges and (min(nb, w), max(nb, w)) != ek)
+                        if rem_d >= 1 and (curr, nb) in pref_dir:
+                            sc = 60.0
+                        elif rem_d >= 1:
+                            sc = 40.0
+                        elif (curr, nb) in pref_dir:
+                            sc = 15.0
+                    if sc > best_sc:
+                        best_sc = sc
+                        chosen_nb, chosen_ek = nb, ek
 
                 used_edges.add(chosen_ek)
                 if chosen_nb in visited_idx:
@@ -574,20 +666,26 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
                     loop = path_nodes[loop_start:]
                     if len(loop) >= 3:
                         _seal_loop(loop)
-                        closed_any = True
                     for removed in path_nodes[loop_start + 1 :]:
                         visited_idx.pop(removed, None)
                     path_nodes = path_nodes[: loop_start + 1]
+                    if len(loop) >= 12 and loop_start <= 16:
+                        rem_at_start = sum(
+                            1 for w in undir_adj[path_nodes[-1]]
+                            if (min(path_nodes[-1], w), max(path_nodes[-1], w)) not in used_edges
+                        )
+                        if rem_at_start == 0:
+                            path_nodes = []
+                            break
                 else:
                     visited_idx[chosen_nb] = len(path_nodes)
                     path_nodes.append(chosen_nb)
 
-            # If a hole boundary was broken by a non-manifold edge into an open chain,
-            # extend backward from u0 as well and seal if endpoints form a valid contour
-            if not closed_any:
+            # Extend backward from u0 if an open chain remains
+            if len(path_nodes) >= 2:
                 back_nodes = []
                 curr_back = u0
-                visited_back = set(longest_open_chain)
+                visited_back = set(path_nodes)
                 while True:
                     back_cands = []
                     for nb in undir_adj[curr_back]:
@@ -606,14 +704,74 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
                     visited_back.add(chosen_nb)
                     curr_back = chosen_nb
 
-                full_chain = list(reversed(back_nodes)) + longest_open_chain
+                full_chain = list(reversed(back_nodes)) + path_nodes
                 if len(full_chain) >= 3:
-                    a_id, b_id = full_chain[0], full_chain[-1]
-                    gap_dist = float(np.linalg.norm(cur_verts[a_id] - cur_verts[b_id]))
-                    chain_pts = cur_verts[np.array(full_chain, dtype=np.int64)]
-                    chain_perim = float(np.linalg.norm(chain_pts[1:] - chain_pts[:-1], axis=1).sum())
-                    if gap_dist < chain_perim * 0.85:
-                        _seal_loop(full_chain)
+                    open_chains.append(full_chain)
+
+        # Multi-Chain Perimeter Stitcher: stitch open boundary chains around large base holes
+        if open_chains:
+            open_chains.sort(key=len, reverse=True)
+            chain_used = [False] * len(open_chains)
+
+            def _chain_perim(ch):
+                pts = cur_verts[np.array(ch, dtype=np.int64)]
+                return float(np.linalg.norm(pts[1:] - pts[:-1], axis=1).sum())
+
+            for i in range(len(open_chains)):
+                if chain_used[i] or len(open_chains[i]) < 3:
+                    continue
+                chain_used[i] = True
+                stitched = list(open_chains[i])
+
+                while True:
+                    head = stitched[0]
+                    tail = stitched[-1]
+                    self_gap = float(np.linalg.norm(cur_verts[tail] - cur_verts[head]))
+                    cur_perim = _chain_perim(stitched)
+
+                    best_idx = -1
+                    best_rev = False
+                    best_prepend = False
+                    best_dist = float("inf")
+
+                    for j in range(len(open_chains)):
+                        if chain_used[j] or len(open_chains[j]) < 3:
+                            continue
+                        cj = open_chains[j]
+                        s_j, e_j = cj[0], cj[-1]
+                        d1 = float(np.linalg.norm(cur_verts[tail] - cur_verts[s_j]))
+                        if d1 < best_dist:
+                            best_dist, best_idx, best_rev, best_prepend = d1, j, False, False
+                        d2 = float(np.linalg.norm(cur_verts[tail] - cur_verts[e_j])) * 1.05
+                        if d2 < best_dist:
+                            best_dist, best_idx, best_rev, best_prepend = d2, j, True, False
+                        d3 = float(np.linalg.norm(cur_verts[e_j] - cur_verts[head]))
+                        if d3 < best_dist:
+                            best_dist, best_idx, best_rev, best_prepend = d3, j, False, True
+                        d4 = float(np.linalg.norm(cur_verts[s_j] - cur_verts[head])) * 1.05
+                        if d4 < best_dist:
+                            best_dist, best_idx, best_rev, best_prepend = d4, j, True, True
+
+                    if len(stitched) >= 8 and cur_perim > 1e-5 and self_gap < cur_perim * 0.45 and self_gap <= best_dist * 1.15:
+                        break
+
+                    if best_idx != -1 and best_dist < bbox_diag * 0.65:
+                        chain_used[best_idx] = True
+                        nxt = list(open_chains[best_idx])
+                        if best_rev:
+                            nxt.reverse()
+                        if best_prepend:
+                            stitched = nxt + stitched
+                        else:
+                            stitched = stitched + nxt
+                    else:
+                        break
+
+                if len(stitched) >= 3:
+                    c_perim = _chain_perim(stitched)
+                    g_dist = float(np.linalg.norm(cur_verts[stitched[0]] - cur_verts[stitched[-1]]))
+                    if c_perim > 1e-6 and g_dist < c_perim * 0.85:
+                        _seal_loop(stitched)
 
         faces = np.vstack(new_faces)
         total_loops_closed += loops_in_pass
@@ -740,7 +898,7 @@ def _make_obj_watertight(path):
     used_edges = set()
 
     # Prune degree-1 dead-end spurs at branch vertices
-    for _prune_it in range(4):
+    for _prune_it in range(8):
         pruned_any = False
         for u, nbs in list(undir_adj.items()):
             alive = [nb for nb in nbs if (min(u, nb), max(u, nb)) not in used_edges]
@@ -764,9 +922,14 @@ def _make_obj_watertight(path):
         nonlocal next_v_idx, next_vt_idx, loops_closed
         loop = []
         for nid in raw_loop:
-            if not loop or loop[-1] != nid:
-                loop.append(int(nid))
-        if len(loop) > 1 and loop[0] == loop[-1]:
+            nid_i = int(nid)
+            if loop and loop[-1] == nid_i:
+                continue
+            if len(loop) >= 2 and loop[-2] == nid_i:
+                loop.pop()
+                continue
+            loop.append(nid_i)
+        while len(loop) > 2 and loop[0] == loop[-1]:
             loop.pop()
 
         L = len(loop)
@@ -809,13 +972,38 @@ def _make_obj_watertight(path):
             loops_closed += 1
             return
 
-        curr_pts = verts_arr[np.array(loop, dtype=np.int64)].copy()
-        centroid = curr_pts.mean(axis=0)
-        # Store 1-based (v_idx, vt_idx) pairs for current ring
-        curr_ring = [
-            (n + 1, (face_v_to_vt.get(n, 0) + 1) if has_vt else 1)
-            for n in loop
-        ]
+        # Subdivide any long bridged gap (> 2.2x median loop edge) so all sides of the hole
+        # have uniform vertex density before 2-to-1 ring reduction
+        pts0 = verts_arr[np.array(loop, dtype=np.int64)]
+        seg_d = np.linalg.norm(np.roll(pts0, -1, axis=0) - pts0, axis=1)
+        valid_d = seg_d[seg_d > 1e-6]
+        med_edge = float(np.median(valid_d)) if len(valid_d) > 0 else bbox_diag * 0.015
+
+        curr_ring = []
+        ring_pts_list = []
+        for i in range(L):
+            u_id = loop[i]
+            v_id = loop[(i + 1) % L]
+            p_u = verts_arr[u_id]
+            p_v = verts_arr[v_id]
+            vt_u = (face_v_to_vt.get(u_id, 0) + 1) if has_vt else 1
+            curr_ring.append((u_id + 1, vt_u))
+            ring_pts_list.append(p_u)
+
+            d_uv = float(np.linalg.norm(p_v - p_u))
+            if med_edge > 1e-6 and d_uv > med_edge * 2.2:
+                n_sub = min(48, int(math.ceil(d_uv / med_edge)) - 1)
+                for s in range(1, n_sub + 1):
+                    t = float(s) / float(n_sub + 1)
+                    sp = (1.0 - t) * p_u + t * p_v
+                    append_v_lines.append("v %.6f %.6f %.6f" % (sp[0], sp[1], sp[2]))
+                    curr_ring.append((next_v_idx, rep_vt_1based))
+                    next_v_idx += 1
+                    ring_pts_list.append(sp)
+
+        curr_pts = np.array(ring_pts_list, dtype=np.float64)
+        seg_w = np.linalg.norm(np.roll(curr_pts, -1, axis=0) - curr_pts, axis=1, keepdims=True) + 1e-7
+        centroid = (0.5 * (curr_pts + np.roll(curr_pts, -1, axis=0)) * seg_w).sum(axis=0) / float(seg_w.sum())
 
         while len(curr_ring) > 8:
             M = len(curr_ring)
@@ -885,6 +1073,8 @@ def _make_obj_watertight(path):
 
         loops_closed += 1
 
+    open_chains = []
+
     for e_start in list(boundary_edges):
         if e_start in used_edges:
             continue
@@ -894,10 +1084,9 @@ def _make_obj_watertight(path):
         used_edges.add(e_start)
         path_nodes = [u0, v0]
         visited_idx = {u0: 0, v0: 1}
-        longest_open_chain = [u0, v0]
-        closed_any = False
+        spur_backtracks = 0
 
-        while len(path_nodes) >= 2:
+        while len(path_nodes) > 0:
             curr = path_nodes[-1]
             candidates = [
                 (nb, (min(curr, nb), max(curr, nb)))
@@ -905,22 +1094,48 @@ def _make_obj_watertight(path):
                 if (min(curr, nb), max(curr, nb)) not in used_edges
             ]
             if not candidates:
-                if len(path_nodes) > len(longest_open_chain):
-                    longest_open_chain = list(path_nodes)
-                dead = path_nodes.pop()
-                visited_idx.pop(dead, None)
-                continue
+                branch_k = -1
+                for k in range(len(path_nodes) - 2, -1, -1):
+                    nk = path_nodes[k]
+                    if any((min(nk, w), max(nk, w)) not in used_edges for w in undir_adj[nk]):
+                        branch_k = k
+                        break
+                if branch_k != -1 and (len(path_nodes) - 1 - branch_k) <= 24 and spur_backtracks <= 32:
+                    while len(path_nodes) > branch_k + 1:
+                        dead = path_nodes.pop()
+                        visited_idx.pop(dead, None)
+                    spur_backtracks += 1
+                    continue
+                break
+
+            spur_backtracks = 0
+            has_unvisited_cont = any(
+                nb not in visited_idx
+                and any((min(nb, w), max(nb, w)) not in used_edges and (min(nb, w), max(nb, w)) != ek for w in undir_adj[nb])
+                for nb, ek in candidates
+            )
 
             chosen_nb, chosen_ek = candidates[0]
+            best_sc = -1e9
             for nb, ek in candidates:
+                sc = 1.0
                 if nb in visited_idx and len(path_nodes) - visited_idx[nb] >= 3:
+                    cyc_len = len(path_nodes) - visited_idx[nb]
+                    if visited_idx[nb] == 0 or cyc_len >= 16 or not has_unvisited_cont:
+                        sc = 200.0
+                    else:
+                        sc = 5.0
+                else:
+                    rem_d = sum(1 for w in undir_adj[nb] if (min(nb, w), max(nb, w)) not in used_edges and (min(nb, w), max(nb, w)) != ek)
+                    if rem_d >= 1 and (curr, nb) in pref_dir:
+                        sc = 60.0
+                    elif rem_d >= 1:
+                        sc = 40.0
+                    elif (curr, nb) in pref_dir:
+                        sc = 15.0
+                if sc > best_sc:
+                    best_sc = sc
                     chosen_nb, chosen_ek = nb, ek
-                    break
-            else:
-                for nb, ek in candidates:
-                    if (curr, nb) in pref_dir:
-                        chosen_nb, chosen_ek = nb, ek
-                        break
 
             used_edges.add(chosen_ek)
             if chosen_nb in visited_idx:
@@ -928,18 +1143,25 @@ def _make_obj_watertight(path):
                 loop = path_nodes[loop_start:]
                 if len(loop) >= 3:
                     _seal_obj_loop(loop)
-                    closed_any = True
                 for removed in path_nodes[loop_start + 1 :]:
                     visited_idx.pop(removed, None)
                 path_nodes = path_nodes[: loop_start + 1]
+                if len(loop) >= 12 and loop_start <= 16:
+                    rem_at_start = sum(
+                        1 for w in undir_adj[path_nodes[-1]]
+                        if (min(path_nodes[-1], w), max(path_nodes[-1], w)) not in used_edges
+                    )
+                    if rem_at_start == 0:
+                        path_nodes = []
+                        break
             else:
                 visited_idx[chosen_nb] = len(path_nodes)
                 path_nodes.append(chosen_nb)
 
-        if not closed_any:
+        if len(path_nodes) >= 2:
             back_nodes = []
             curr_back = u0
-            visited_back = set(longest_open_chain)
+            visited_back = set(path_nodes)
             while True:
                 back_cands = [
                     (nb, (min(curr_back, nb), max(curr_back, nb)))
@@ -958,14 +1180,74 @@ def _make_obj_watertight(path):
                 visited_back.add(chosen_nb)
                 curr_back = chosen_nb
 
-            full_chain = list(reversed(back_nodes)) + longest_open_chain
+            full_chain = list(reversed(back_nodes)) + path_nodes
             if len(full_chain) >= 3:
-                a_id, b_id = full_chain[0], full_chain[-1]
-                gap_dist = float(np.linalg.norm(verts_arr[a_id] - verts_arr[b_id]))
-                chain_pts = verts_arr[np.array(full_chain, dtype=np.int64)]
-                chain_perim = float(np.linalg.norm(chain_pts[1:] - chain_pts[:-1], axis=1).sum())
-                if gap_dist < chain_perim * 0.85:
-                    _seal_obj_loop(full_chain)
+                open_chains.append(full_chain)
+
+    # Multi-Chain Perimeter Stitcher for OBJ
+    if open_chains:
+        open_chains.sort(key=len, reverse=True)
+        chain_used = [False] * len(open_chains)
+
+        def _obj_chain_perim(ch):
+            pts = verts_arr[np.array(ch, dtype=np.int64)]
+            return float(np.linalg.norm(pts[1:] - pts[:-1], axis=1).sum())
+
+        for i in range(len(open_chains)):
+            if chain_used[i] or len(open_chains[i]) < 3:
+                continue
+            chain_used[i] = True
+            stitched = list(open_chains[i])
+
+            while True:
+                head = stitched[0]
+                tail = stitched[-1]
+                self_gap = float(np.linalg.norm(verts_arr[tail] - verts_arr[head]))
+                cur_perim = _obj_chain_perim(stitched)
+
+                best_idx = -1
+                best_rev = False
+                best_prepend = False
+                best_dist = float("inf")
+
+                for j in range(len(open_chains)):
+                    if chain_used[j] or len(open_chains[j]) < 3:
+                        continue
+                    cj = open_chains[j]
+                    s_j, e_j = cj[0], cj[-1]
+                    d1 = float(np.linalg.norm(verts_arr[tail] - verts_arr[s_j]))
+                    if d1 < best_dist:
+                        best_dist, best_idx, best_rev, best_prepend = d1, j, False, False
+                    d2 = float(np.linalg.norm(verts_arr[tail] - verts_arr[e_j])) * 1.05
+                    if d2 < best_dist:
+                        best_dist, best_idx, best_rev, best_prepend = d2, j, True, False
+                    d3 = float(np.linalg.norm(verts_arr[e_j] - verts_arr[head]))
+                    if d3 < best_dist:
+                        best_dist, best_idx, best_rev, best_prepend = d3, j, False, True
+                    d4 = float(np.linalg.norm(verts_arr[s_j] - verts_arr[head])) * 1.05
+                    if d4 < best_dist:
+                        best_dist, best_idx, best_rev, best_prepend = d4, j, True, True
+
+                if len(stitched) >= 8 and cur_perim > 1e-5 and self_gap < cur_perim * 0.45 and self_gap <= best_dist * 1.15:
+                    break
+
+                if best_idx != -1 and best_dist < bbox_diag * 0.65:
+                    chain_used[best_idx] = True
+                    nxt = list(open_chains[best_idx])
+                    if best_rev:
+                        nxt.reverse()
+                    if best_prepend:
+                        stitched = nxt + stitched
+                    else:
+                        stitched = stitched + nxt
+                else:
+                    break
+
+            if len(stitched) >= 3:
+                c_perim = _obj_chain_perim(stitched)
+                g_dist = float(np.linalg.norm(verts_arr[stitched[0]] - verts_arr[stitched[-1]]))
+                if c_perim > 1e-6 and g_dist < c_perim * 0.85:
+                    _seal_obj_loop(stitched)
 
     if append_f_lines:
         out_block = ["", "# Watertight hole-closing cap"] + append_v_lines + append_vt_lines + append_f_lines
