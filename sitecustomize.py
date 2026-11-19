@@ -426,6 +426,48 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
             valid_d = seg_d[seg_d > 1e-6]
             med_edge = float(np.median(valid_d)) if len(valid_d) > 0 else bbox_diag * 0.015
 
+            # Shortcut narrow outward spike excursions along the loop so the cap never stretches webs out to spikes
+            if len(loop_nodes) >= 16:
+                for _ex_pass in range(2):
+                    n_b = len(loop_nodes)
+                    if n_b < 16:
+                        break
+                    max_span = min(64, n_b // 4)
+                    pruned_loop = []
+                    idx_l = 0
+                    while idx_l < n_b:
+                        p_a = cur_verts[loop_nodes[idx_l]]
+                        jump_to = -1
+                        arc_acc = 0.0
+                        prev_p = p_a
+                        lim = min(max_span, n_b - 1 - idx_l)
+                        for s in range(1, lim + 1):
+                            p_b = cur_verts[loop_nodes[idx_l + s]]
+                            arc_acc += float(np.linalg.norm(p_b - prev_p))
+                            prev_p = p_b
+                            if s >= 3:
+                                chord = float(np.linalg.norm(p_b - p_a))
+                                if chord < med_edge * 4.5 and arc_acc > max(med_edge * 5.0, chord * 2.6):
+                                    jump_to = idx_l + s
+                        pruned_loop.append(loop_nodes[idx_l])
+                        if jump_to != -1:
+                            idx_l = jump_to
+                        else:
+                            idx_l += 1
+                    if 3 <= len(pruned_loop) < len(loop_nodes):
+                        loop_nodes = pruned_loop
+                    else:
+                        break
+
+            L0 = len(loop_nodes)
+            if L0 < 3:
+                return
+
+            pts0 = cur_verts[np.array(loop_nodes, dtype=np.int64)]
+            seg_d = np.linalg.norm(np.roll(pts0, -1, axis=0) - pts0, axis=1)
+            if float(seg_d.max()) > bbox_diag * 0.24:
+                return
+
             ring_ids = []
             ring_pts_list = []
             ring_cols_list = []
@@ -752,10 +794,10 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
                         if d4 < best_dist:
                             best_dist, best_idx, best_rev, best_prepend = d4, j, True, True
 
-                    if len(stitched) >= 8 and cur_perim > 1e-5 and self_gap < cur_perim * 0.45 and self_gap <= best_dist * 1.15:
+                    if len(stitched) >= 8 and cur_perim > 1e-5 and self_gap < cur_perim * 0.35 and self_gap < bbox_diag * 0.22 and self_gap <= best_dist * 1.15:
                         break
 
-                    if best_idx != -1 and best_dist < bbox_diag * 0.65:
+                    if best_idx != -1 and best_dist < bbox_diag * 0.16:
                         chain_used[best_idx] = True
                         nxt = list(open_chains[best_idx])
                         if best_rev:
@@ -770,7 +812,7 @@ def _close_mesh_boundaries_numpy(verts, faces, colors=None):
                 if len(stitched) >= 3:
                     c_perim = _chain_perim(stitched)
                     g_dist = float(np.linalg.norm(cur_verts[stitched[0]] - cur_verts[stitched[-1]]))
-                    if c_perim > 1e-6 and g_dist < c_perim * 0.85:
+                    if c_perim > 1e-6 and g_dist < min(c_perim * 0.45, bbox_diag * 0.22):
                         _seal_loop(stitched)
 
         faces = np.vstack(new_faces)
@@ -1228,10 +1270,10 @@ def _make_obj_watertight(path):
                     if d4 < best_dist:
                         best_dist, best_idx, best_rev, best_prepend = d4, j, True, True
 
-                if len(stitched) >= 8 and cur_perim > 1e-5 and self_gap < cur_perim * 0.45 and self_gap <= best_dist * 1.15:
+                if len(stitched) >= 8 and cur_perim > 1e-5 and self_gap < cur_perim * 0.35 and self_gap < bbox_diag * 0.22 and self_gap <= best_dist * 1.15:
                     break
 
-                if best_idx != -1 and best_dist < bbox_diag * 0.65:
+                if best_idx != -1 and best_dist < bbox_diag * 0.16:
                     chain_used[best_idx] = True
                     nxt = list(open_chains[best_idx])
                     if best_rev:
@@ -1246,7 +1288,7 @@ def _make_obj_watertight(path):
             if len(stitched) >= 3:
                 c_perim = _obj_chain_perim(stitched)
                 g_dist = float(np.linalg.norm(verts_arr[stitched[0]] - verts_arr[stitched[-1]]))
-                if c_perim > 1e-6 and g_dist < c_perim * 0.85:
+                if c_perim > 1e-6 and g_dist < min(c_perim * 0.45, bbox_diag * 0.22):
                     _seal_obj_loop(stitched)
 
     if append_f_lines:
