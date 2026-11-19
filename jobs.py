@@ -350,7 +350,7 @@ class JobManager:
             f"GPU_MON_PID=$!\n"
             f"trap 'RC=$?; kill $GPU_MON_PID 2>/dev/null; echo $RC > {exit_file}' EXIT\n"
             "\n"
-            "source /home/vk499oc/miniconda3/etc/profile.d/conda.sh\n"
+            "source \"$HOME/miniconda3/etc/profile.d/conda.sh\"\n"
             f"conda activate {shlex.quote(config.COLMAP_ENV)}\n"
             "\n"
             f"SUGAR_ROOT={shlex.quote(str(config.SUGAR_ROOT))} "
